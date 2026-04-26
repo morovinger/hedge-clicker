@@ -45,148 +45,213 @@
   
 
   // ═══ capture.js ═══
-  // ── WebGL Frame Capture ──
-  // Hooks HTMLCanvasElement.prototype.getContext at document_start so we can
-  // piggy-back on whatever WebGL context PIXI creates (no preemptive creation
-  // — that would steal the context type and break PIXI with a null-ctx crash).
-  //
-  // When PIXI calls canvas.getContext('webgl' | 'webgl2'), our hook records the
-  // canvas+context and wraps every draw-* method. Capture itself happens on the
-  // last drawcall of each frame (count detected via setTimeout-based idle).
+  // ── Canvas locator (was: WebGL frame capture) ──
+  // Pivoted away from pixel capture — see doc/01-pixel-capture-attempt.md.
+  // This stub only locates the game canvas and exposes a tiny ready API so
+  // downstream modules (clicker, visit, ui) keep their existing imports.
+  // No prototype hooks, no GL context creation, no draw-method wrapping.
   
-  // Idempotent guard: if already installed (e.g. extension reload), reuse it
-  // rather than wrapping the prototype again — re-wrapping causes draw methods
-  // to call readPixels N times per call and freezes the renderer.
   if (window.HC_Capture) {
-    console.log('[HC] Capture already installed — reusing.');
+    console.log('[HC] Capture stub already installed — reusing.');
   } else {
   window.HC_Capture = (function() {
     let canvas = null;
-    let gl = null;
-    let frameData = null;
-    let captureRequested = true;
-    let totalDrawCalls = 0;
-    let drawsThisFrame = 0;
-    let drawsLastFrame = 0;
-    let drawsLastFrameValid = false;
-    let frameEndTimer = null;
-    let missedFrames = 0;
-    const wrappedNames = [];
     const readyCallbacks = [];
   
-    function maybeCapture() {
-      totalDrawCalls++;
-      drawsThisFrame++;
-  
-      if (frameEndTimer) clearTimeout(frameEndTimer);
-      frameEndTimer = setTimeout(() => {
-        if (drawsThisFrame > 0) {
-          if (captureRequested) {
-            missedFrames++;
-            if (missedFrames >= 2) drawsLastFrame = drawsThisFrame;
-          } else {
-            drawsLastFrame = drawsThisFrame;
+    function tryFind() {
+      if (canvas) return canvas;
+      const candidates = document.querySelectorAll('canvas');
+      for (const c of candidates) {
+        // Game canvas is the non-default-size one (1000x700).
+        if (c.width !== 300 || c.height !== 150) {
+          canvas = c;
+          while (readyCallbacks.length) {
+            try { readyCallbacks.shift()(); } catch (e) { console.error(e); }
           }
-          drawsLastFrameValid = true;
+          console.log('[HC] Canvas located:', canvas.width + 'x' + canvas.height);
+          return canvas;
         }
-        drawsThisFrame = 0;
-        frameEndTimer = null;
-      }, 1);
-  
-      if (captureRequested && drawsLastFrameValid && drawsThisFrame >= drawsLastFrame) {
-        try {
-          const w = canvas.width, h = canvas.height;
-          const pixels = new Uint8Array(w * h * 4);
-          gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-          frameData = { data: pixels, width: w, height: h, time: Date.now() };
-          captureRequested = false;
-          missedFrames = 0;
-        } catch(e) {}
       }
+      return null;
     }
   
-    function wrap(obj, name) {
-      const orig = obj[name];
-      if (typeof orig !== 'function') return false;
-      obj[name] = function() {
-        orig.apply(obj, arguments);
-        maybeCapture();
-      };
-      return true;
-    }
-  
-    function attachToContext(c, ctx) {
-      if (gl) return;
-      canvas = c;
-      gl = ctx;
-  
-      for (const n of ['drawElements', 'drawArrays', 'drawElementsInstanced',
-                       'drawArraysInstanced', 'drawRangeElements']) {
-        if (wrap(gl, n)) wrappedNames.push(n);
-      }
-      try {
-        const ext = gl.getExtension && gl.getExtension('ANGLE_instanced_arrays');
-        if (ext) {
-          for (const n of ['drawElementsInstancedANGLE', 'drawArraysInstancedANGLE']) {
-            if (wrap(ext, n)) wrappedNames.push('ext.' + n);
-          }
-        }
-      } catch (e) {}
-  
-      console.log('[HC] Capture attached. Hooks:', wrappedNames.join(', '),
-                  'canvas:', canvas.width + 'x' + canvas.height);
-      while (readyCallbacks.length) {
-        try { readyCallbacks.shift()(); } catch (e) { console.error(e); }
-      }
-    }
-  
-    // Hook getContext on the prototype (document_start ensures we beat PIXI).
-    const proto = HTMLCanvasElement.prototype;
-    const origGetContext = proto.getContext;
-    proto.getContext = function(type, ...rest) {
-      const ctx = origGetContext.call(this, type, ...rest);
-      if (!gl && ctx &&
-          (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl')) {
-        attachToContext(this, ctx);
-      }
-      return ctx;
-    };
-  
-    // Paste-mode fallback: if a non-default-size canvas already exists, it almost
-    // certainly already has a WebGL context. Probe it (origGetContext on a canvas
-    // that already has a context returns the existing one without creating).
-    for (const c of document.querySelectorAll('canvas')) {
-      if (c.width === 300 && c.height === 150) continue; // default — likely no context
-      let ctx = origGetContext.call(c, 'webgl2');
-      if (!ctx) ctx = origGetContext.call(c, 'webgl');
-      if (ctx) { attachToContext(c, ctx); break; }
+    // Try immediately, then poll until canvas appears.
+    if (!tryFind()) {
+      const poll = setInterval(() => { if (tryFind()) clearInterval(poll); }, 200);
+      setTimeout(() => clearInterval(poll), 60000); // give up after 60s
     }
   
     return {
       get canvas() { return canvas; },
-      get gl() { return gl; },
-      requestFrame() { captureRequested = true; },
-      getFrame() { return frameData; },
-      getDrawCallCount() { return totalDrawCalls; },
-      getDrawsLastFrame() { return drawsLastFrame; },
-      isReady() { return !!gl; },
-      whenReady(cb) { gl ? cb() : readyCallbacks.push(cb); },
-      getCaptureState() {
-        return {
-          ready: !!gl,
-          captureRequested,
-          totalDrawCalls,
-          drawsThisFrame,
-          drawsLastFrame,
-          drawsLastFrameValid,
-          frameAge: frameData ? Date.now() - frameData.time : null,
-          wrappedMethods: wrappedNames,
-          canvas: canvas ? [canvas.width, canvas.height] : null,
-        };
-      },
+      isReady() { return !!canvas; },
+      whenReady(cb) { canvas ? cb() : readyCallbacks.push(cb); },
     };
   })();
-  } // end HC_Capture install guard
+  }
+  
+
+  // ═══ scenegraph.js ═══
+  // ── PIXI scene-graph access ──
+  // Discovers the PIXI Application in the iframe and provides a tree walker
+  // for finding sprites by texture name, parent name, or custom predicate.
+  // See doc/02-pixi-scenegraph-pivot.md.
+  
+  if (window.HC_Scene) {
+    console.log('[HC] Scene already installed — reusing.');
+  } else {
+  window.HC_Scene = (function() {
+    let pixiApp = null;
+    let stage = null;
+    let renderer = null;
+  
+    // --- Discovery strategies (try in order) ---
+  
+    function discover() {
+      if (pixiApp) return pixiApp;
+  
+      // 1. PIXI Devtools convention: __PIXI_APP__ or __PIXI_DEVTOOLS_GLOBAL_HOOK__
+      const knownGlobals = [
+        '__PIXI_APP__', '__PIXI_RENDERER__', '__PIXI_STAGE__',
+        'app', 'game', 'pixiApp', '_app',
+      ];
+      for (const k of knownGlobals) {
+        const v = window[k];
+        if (v && (v.stage || v.scene)) {
+          pixiApp = v;
+          return capture();
+        }
+      }
+  
+      // 2. Walk window properties for any object with .stage and .renderer
+      try {
+        for (const k of Object.keys(window)) {
+          if (k.startsWith('__hc')) continue; // skip our own
+          let v;
+          try { v = window[k]; } catch (e) { continue; }
+          if (v && typeof v === 'object' && v.stage && v.renderer) {
+            pixiApp = v;
+            return capture();
+          }
+        }
+      } catch (e) {}
+  
+      // 3. PIXI namespace exposed?
+      if (window.PIXI) {
+        // Some apps store the renderer as PIXI.autoDetectRenderer's last result,
+        // or instances are tracked. Best-effort:
+        const PIXI = window.PIXI;
+        if (PIXI._app || PIXI.app) {
+          pixiApp = PIXI._app || PIXI.app;
+          return capture();
+        }
+      }
+  
+      // 4. Nothing found yet.
+      return null;
+    }
+  
+    function capture() {
+      if (!pixiApp) return null;
+      stage = pixiApp.stage || pixiApp.scene || null;
+      renderer = pixiApp.renderer || null;
+      return pixiApp;
+    }
+  
+    // --- Tree walking ---
+  
+    function* walk(node, depth = 0, maxDepth = 50) {
+      if (!node || depth > maxDepth) return;
+      yield { node, depth };
+      const children = node.children;
+      if (Array.isArray(children)) {
+        for (const c of children) yield* walk(c, depth + 1, maxDepth);
+      }
+    }
+  
+    function describeNode(n) {
+      const tex = n.texture;
+      let texIds = null;
+      if (tex && tex.textureCacheIds) texIds = tex.textureCacheIds.slice(0, 3);
+      else if (tex && tex.baseTexture && tex.baseTexture.cacheId) texIds = [tex.baseTexture.cacheId];
+      let worldPos = null;
+      try {
+        if (n.worldTransform) worldPos = [Math.round(n.worldTransform.tx), Math.round(n.worldTransform.ty)];
+        else if (n.x !== undefined) worldPos = [Math.round(n.x), Math.round(n.y)];
+      } catch (e) {}
+      return {
+        type: n.constructor && n.constructor.name,
+        name: n.name || null,
+        visible: n.visible !== false,
+        worldVisible: n.worldVisible !== false,
+        interactive: !!n.interactive,
+        worldPos,
+        texIds,
+        childCount: (n.children && n.children.length) || 0,
+        width: n.width !== undefined ? Math.round(n.width) : null,
+        height: n.height !== undefined ? Math.round(n.height) : null,
+      };
+    }
+  
+    function summarize(maxNodes = 200) {
+      discover();
+      if (!stage) return { error: 'no PIXI stage found', tried: 'globals + .stage walk + PIXI namespace' };
+      const nodes = [];
+      let n = 0;
+      for (const { node, depth } of walk(stage)) {
+        if (n++ >= maxNodes) break;
+        nodes.push({ depth, ...describeNode(node) });
+      }
+      return { nodeCount: n, sample: nodes };
+    }
+  
+    // Find nodes whose texture id contains any of the given substrings.
+    function findByTexture(...substrings) {
+      discover();
+      if (!stage) return [];
+      const matches = [];
+      for (const { node, depth } of walk(stage)) {
+        const tex = node.texture;
+        let ids = [];
+        if (tex && tex.textureCacheIds) ids = tex.textureCacheIds;
+        else if (tex && tex.baseTexture && tex.baseTexture.cacheId) ids = [tex.baseTexture.cacheId];
+        for (const id of ids) {
+          if (typeof id !== 'string') continue;
+          if (substrings.some(s => id.toLowerCase().includes(s.toLowerCase()))) {
+            matches.push({ depth, ...describeNode(node) });
+            break;
+          }
+        }
+      }
+      return matches;
+    }
+  
+    // Find unique texture ids across the tree (helps identify sprite assets).
+    function listTextures(limit = 100) {
+      discover();
+      if (!stage) return [];
+      const seen = new Set();
+      for (const { node } of walk(stage)) {
+        const tex = node.texture;
+        if (tex && tex.textureCacheIds) tex.textureCacheIds.forEach(id => seen.add(id));
+        else if (tex && tex.baseTexture && tex.baseTexture.cacheId) seen.add(tex.baseTexture.cacheId);
+        if (seen.size > limit) break;
+      }
+      return Array.from(seen);
+    }
+  
+    return {
+      discover,
+      isReady() { return !!stage; },
+      getApp() { return pixiApp; },
+      getStage() { return stage; },
+      getRenderer() { return renderer; },
+      summarize,
+      findByTexture,
+      listTextures,
+      describeNode,
+    };
+  })();
+  }
   
 
   // ═══ vision.js ═══

@@ -12,7 +12,7 @@ const PASTE_OUT = path.join(__dirname, 'clicker.js');
 const EXT_OUT = path.join(__dirname, 'chrome-ext', 'iframe-script.js');
 
 // Load order matters: config → capture → vision → clicker → visit → ui
-const modules = ['config.js', 'capture.js', 'vision.js', 'clicker.js', 'visit.js', 'ui.js'];
+const modules = ['config.js', 'capture.js', 'scenegraph.js', 'vision.js', 'clicker.js', 'visit.js', 'ui.js'];
 
 function readModules() {
   return modules.map(file => ({
@@ -125,9 +125,76 @@ function buildExtBundle(mods) {
             // — easier: call the dispatch directly via a tiny helper below
             value = 'queued';
             break;
-          case 'sample':       value = HC_Vision.samplePixel(HC_Capture.getFrame(), args[0], args[1]); break;
           case 'getCfg':       value = HC_CFG; break;
           case 'setCfg':       Object.assign(HC_CFG, args[0]); value = HC_CFG; break;
+          // ── PIXI scene-graph probes ──
+          case 'pixiDiscover': value = { found: !!HC_Scene.discover(), ready: HC_Scene.isReady() }; break;
+          case 'pixiDeep': {
+            const out = { hasPIXI: !!window.PIXI };
+            if (window.PIXI) {
+              out.pixiKeys = Object.keys(window.PIXI).slice(0, 50);
+              out.version = window.PIXI.VERSION || window.PIXI.version || null;
+              out.hasApplication = !!window.PIXI.Application;
+            }
+            out.devtoolsHook = !!window.__PIXI_DEVTOOLS_GLOBAL_HOOK__;
+            if (window.__PIXI_DEVTOOLS_GLOBAL_HOOK__) {
+              const h = window.__PIXI_DEVTOOLS_GLOBAL_HOOK__;
+              out.devtoolsKeys = Object.keys(h).slice(0, 30);
+              // PIXI's devtools register: store all registered apps
+              try {
+                if (h.apps) out.appsCount = h.apps.length || Object.keys(h.apps).length;
+                if (h.app) out.hasApp = true;
+                if (h.renderers) out.renderersCount = h.renderers.length || Object.keys(h.renderers).length;
+              } catch (e) {}
+            }
+            // Also check inspector hook
+            out.inspectorHook = !!window.__PIXI_INSPECTOR_GLOBAL_HOOK__;
+            // Probe canvas backref
+            try {
+              const c = HC_Capture.canvas;
+              if (c) {
+                out.canvasKeys = Object.keys(c).filter(k => k.toLowerCase().includes('pixi') || k.startsWith('_'));
+              }
+            } catch (e) {}
+            // Search nested: PIXI.utils, PIXI.Application
+            try {
+              if (window.PIXI && window.PIXI.utils) {
+                out.utilsKeys = Object.keys(window.PIXI.utils).slice(0, 20);
+                if (window.PIXI.utils.TextureCache) {
+                  out.textureCacheCount = Object.keys(window.PIXI.utils.TextureCache).length;
+                }
+              }
+            } catch (e) {}
+            value = out;
+            break;
+          }
+          case 'pixiSummary':  value = HC_Scene.summarize(args[0] || 200); break;
+          case 'pixiTextures': value = HC_Scene.listTextures(args[0] || 100); break;
+          case 'pixiFindTex':  value = HC_Scene.findByTexture(...args); break;
+          case 'pixiGlobals':  {
+            // List window properties that look like a PIXI app (have .stage)
+            const out = [];
+            try {
+              for (const k of Object.keys(window)) {
+                if (k.startsWith('__hc') || k.startsWith('HC_')) continue;
+                let v;
+                try { v = window[k]; } catch (e) { continue; }
+                if (v && typeof v === 'object') {
+                  const has = {
+                    stage: !!v.stage,
+                    renderer: !!v.renderer,
+                    ticker: !!v.ticker,
+                    view: !!v.view,
+                  };
+                  if (has.stage || (has.renderer && has.view)) {
+                    out.push({ key: k, has, ctor: v.constructor && v.constructor.name });
+                  }
+                }
+              }
+            } catch (e) {}
+            value = { hits: out, hasPIXI: !!window.PIXI };
+            break;
+          }
           case 'enumCanvases': {
             const list = Array.from(document.querySelectorAll('canvas')).map((c, i) => {
               const r = c.getBoundingClientRect();
@@ -188,8 +255,9 @@ function buildExtBundle(mods) {
 `;
 
   // Eager modules: run immediately at document_start. config has no DOM deps;
-  // capture installs its getContext hook before PIXI runs.
-  const eagerFiles = new Set(['config.js', 'capture.js']);
+  // capture is a thin canvas locator; scenegraph installs no hooks but is safe
+  // to load early so its discover() can run any time.
+  const eagerFiles = new Set(['config.js', 'capture.js', 'scenegraph.js']);
   const eagerMods = mods.filter(m => eagerFiles.has(m.file));
   const lazyMods = mods.filter(m => !eagerFiles.has(m.file));
 
