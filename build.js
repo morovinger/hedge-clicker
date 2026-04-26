@@ -8,7 +8,7 @@ const SRC = path.join(__dirname, 'src');
 const OUT = path.join(__dirname, 'clicker.js');
 
 // Load order matters: config → capture → vision → clicker → ui
-const modules = ['config.js', 'capture.js', 'vision.js', 'clicker.js', 'ui.js'];
+const modules = ['config.js', 'capture.js', 'vision.js', 'clicker.js', 'visit.js', 'ui.js'];
 
 const header = `// Hedgehog Smart Collector (Ёжики) - Vision-based Auto-Clicker
 // Built: ${new Date().toISOString().slice(0, 10)}

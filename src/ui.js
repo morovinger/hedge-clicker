@@ -5,6 +5,7 @@ window.HC_UI = (function() {
   const vis = window.HC_Vision;
   const cfg = window.HC_CFG;
   const clicker = window.HC_Clicker;
+  const visit = window.HC_Visit;
   const canvas = cap.canvas;
 
   const MODES = ['smart', 'grid', 'single'];
@@ -50,6 +51,11 @@ window.HC_UI = (function() {
         <button class="hb b" id="hc-cal" style="font-size:11px">Calibrate</button>
         <button class="hb b" id="hc-pick" style="font-size:11px">Pick Target</button>
       </div>
+      <div class="hbs">
+        <button class="hb p" id="hc-visit" style="font-size:11px">Visit Loop</button>
+        <button class="hb b" id="hc-pick-home" style="font-size:11px">Set Home Btn</button>
+      </div>
+      <div id="hc-visit-stats" style="font-size:10px;color:#b388ff;margin-top:3px"></div>
       <div id="hc-cal-out"></div>
       <div id="hc-det">Detected: -</div>
       <div id="hc-stats">Clicks: 0 | Scans: 0</div>
@@ -143,6 +149,32 @@ window.HC_UI = (function() {
     document.getElementById('hc-pick').className = 'hb b';
   }, true);
 
+  // ── Visit Loop ──
+  const visitBtn = document.getElementById('hc-visit');
+  visitBtn.addEventListener('click', () => {
+    if (!visit) return;
+    visit.toggle();
+    updateVisitUI();
+  });
+
+  // ── Set Home Button (calibrate "Домой" coords) ──
+  let pickingHome = false;
+  document.getElementById('hc-pick-home').addEventListener('click', () => {
+    pickingHome = true;
+    document.getElementById('hc-pick-home').textContent = 'Click Домой...';
+    document.getElementById('hc-pick-home').className = 'hb o';
+  });
+  canvas.addEventListener('click', e => {
+    if (!pickingHome) return;
+    const rect = canvas.getBoundingClientRect();
+    const tx = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+    const ty = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+    if (visit) visit.setHomeBtn(tx, ty);
+    pickingHome = false;
+    document.getElementById('hc-pick-home').textContent = 'Home(' + tx + ',' + ty + ')';
+    document.getElementById('hc-pick-home').className = 'hb b';
+  }, true);
+
   // ── F2 hotkey ──
   document.addEventListener('keydown', e => {
     if (e.key === 'F2') { e.preventDefault(); clicker.toggle(); updateUI(); }
@@ -174,6 +206,17 @@ window.HC_UI = (function() {
         : '');
   }
 
+  function updateVisitUI() {
+    if (!visit) return;
+    const r = visit.isRunning();
+    const s = visit.getStats();
+    visitBtn.textContent = r ? 'STOP Visit' : 'Visit Loop';
+    visitBtn.className = r ? 'hb r' : 'hb p';
+    document.getElementById('hc-visit-stats').textContent =
+      'Visit: ' + s.cycleClicks + ' clicks, ' + s.visited + ' farms';
+  }
+
   updateUI();
-  return { updateUI, updateInfo, showDetected };
+  updateVisitUI();
+  return { updateUI, updateInfo, showDetected, updateVisitUI };
 })();
