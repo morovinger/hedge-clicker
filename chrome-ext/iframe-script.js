@@ -38,6 +38,321 @@
   };
   
 
+  // ═══ glspy.js (eager) ═══
+  // ── Inline WebGL call interceptor (option 2) ──
+  // Wraps HTMLCanvasElement.prototype.getContext at document_start so we see
+  // the gl context the game gets. Then monkey-patches the methods we care about
+  // on that gl object to record per-draw state (program, texture, uniforms).
+  // This bypasses the unreachable bundled PIXI scene graph entirely.
+  //
+  // Phase 1: identification only — count draws/frame, unique textures, unique
+  // programs. Once we know whether sprites are batched or per-draw we decide
+  // what to extract next (per-sprite position from translationMatrix uniform,
+  // or vertex-buffer inspection for batched paths).
+  
+  if (window.HC_GLSpy) {
+    console.log('[HC] GLSpy already installed — reusing.');
+  } else {
+  window.HC_GLSpy = (function() {
+    const origGetContext = HTMLCanvasElement.prototype.getContext;
+    let glRef = null;
+    let canvasRef = null;
+  
+    // Per-frame stats. drawsThisFrame is reset by the boundary detector.
+    const stats = {
+      wrapped: false,
+      framesSeen: 0,
+      drawsLastFrame: 0,
+      drawsThisFrame: 0,
+      totalDraws: 0,
+      drawHistogram: {},   // drawsPerFrame -> count
+      programIds: 0,       // assigned via WeakMap
+      textureIds: 0,
+      samples: [],         // last N draws: {prog, tex}
+      sampleCap: 50,
+    };
+  
+    const programIdMap = new WeakMap();
+    const textureIdMap = new WeakMap();
+    const textureInfoById = new Map();   // id -> { kind, src, w, h, frameUploaded }
+    let nextProgramId = 1;
+    let nextTextureId = 1;
+  
+    let currentProgram = null;
+    let currentTexture = null;
+    let frameTimer = null;
+  
+    // Per-frame fingerprint (which textures appeared in the most recent frame)
+    let texSeenThisFrame = new Set();
+    let texSeenLastFrame = new Set();
+    let drawByTexThisFrame = new Map();
+    let drawByTexLastFrame = new Map();
+    let drawByProgThisFrame = new Map();
+    let drawByProgLastFrame = new Map();
+  
+    function idForProgram(p) {
+      if (!p) return null;
+      let id = programIdMap.get(p);
+      if (id == null) { id = nextProgramId++; programIdMap.set(p, id); stats.programIds = nextProgramId - 1; }
+      return id;
+    }
+    function idForTexture(t) {
+      if (!t) return null;
+      let id = textureIdMap.get(t);
+      if (id == null) { id = nextTextureId++; textureIdMap.set(t, id); stats.textureIds = nextTextureId - 1; }
+      return id;
+    }
+  
+    function onDraw(kind) {
+      stats.drawsThisFrame++;
+      stats.totalDraws++;
+      const pid = idForProgram(currentProgram);
+      const tid = idForTexture(currentTexture);
+      if (tid != null) {
+        texSeenThisFrame.add(tid);
+        drawByTexThisFrame.set(tid, (drawByTexThisFrame.get(tid) || 0) + 1);
+      }
+      if (pid != null) {
+        drawByProgThisFrame.set(pid, (drawByProgThisFrame.get(pid) || 0) + 1);
+      }
+      if (stats.samples.length < stats.sampleCap) {
+        stats.samples.push({ kind, prog: pid, tex: tid });
+      }
+      if (frameTimer) clearTimeout(frameTimer);
+      frameTimer = setTimeout(frameBoundary, 8);
+    }
+  
+    function frameBoundary() {
+      const n = stats.drawsThisFrame;
+      if (n > 0) {
+        stats.drawsLastFrame = n;
+        stats.drawHistogram[n] = (stats.drawHistogram[n] || 0) + 1;
+        stats.framesSeen++;
+      }
+      stats.drawsThisFrame = 0;
+      texSeenLastFrame = texSeenThisFrame;
+      texSeenThisFrame = new Set();
+      drawByTexLastFrame = drawByTexThisFrame;
+      drawByTexThisFrame = new Map();
+      drawByProgLastFrame = drawByProgThisFrame;
+      drawByProgThisFrame = new Map();
+    }
+  
+    function describeTexSource(args) {
+      // texImage2D has two overloads:
+      //   (target, level, internalformat, format, type, source)        // 6 args
+      //   (target, level, internalformat, w, h, border, format, type, pixels)  // 9 args
+      if (args.length === 6) {
+        const src = args[5];
+        if (!src) return { kind: 'null' };
+        if (src instanceof HTMLImageElement) return { kind: 'img', src: src.src && src.src.slice(0, 200), w: src.naturalWidth, h: src.naturalHeight };
+        if (src instanceof HTMLCanvasElement) return { kind: 'canvas', w: src.width, h: src.height };
+        if (typeof ImageBitmap !== 'undefined' && src instanceof ImageBitmap) return { kind: 'bitmap', w: src.width, h: src.height };
+        if (src instanceof ImageData) return { kind: 'imageData', w: src.width, h: src.height };
+        if (typeof HTMLVideoElement !== 'undefined' && src instanceof HTMLVideoElement) return { kind: 'video', w: src.videoWidth, h: src.videoHeight };
+        return { kind: 'unknown', ctor: src.constructor && src.constructor.name };
+      }
+      if (args.length >= 8) {
+        return { kind: 'pixels', w: args[3], h: args[4], pixelsLen: args[args.length - 1] && args[args.length - 1].length };
+      }
+      return { kind: 'odd', argc: args.length };
+    }
+  
+    function wrapGl(gl) {
+      if (gl.__hcSpyWrapped) return;
+      gl.__hcSpyWrapped = true;
+      stats.wrapped = true;
+  
+      const origUseProgram = gl.useProgram.bind(gl);
+      gl.useProgram = function(p) { currentProgram = p; return origUseProgram(p); };
+  
+      const origBindTexture = gl.bindTexture.bind(gl);
+      gl.bindTexture = function(target, tex) {
+        if (target === gl.TEXTURE_2D) currentTexture = tex;
+        return origBindTexture(target, tex);
+      };
+  
+      const origDrawElements = gl.drawElements.bind(gl);
+      gl.drawElements = function() { onDraw('elements'); return origDrawElements.apply(null, arguments); };
+  
+      const origDrawArrays = gl.drawArrays.bind(gl);
+      gl.drawArrays = function() { onDraw('arrays'); return origDrawArrays.apply(null, arguments); };
+  
+      const origTexImage2D = gl.texImage2D.bind(gl);
+      gl.texImage2D = function() {
+        try {
+          const tid = idForTexture(currentTexture);
+          if (tid != null) {
+            const info = describeTexSource(arguments);
+            info.frameUploaded = stats.framesSeen;
+            textureInfoById.set(tid, info);
+          }
+        } catch (e) {}
+        return origTexImage2D.apply(null, arguments);
+      };
+  
+      const origTexSubImage2D = gl.texSubImage2D.bind(gl);
+      gl.texSubImage2D = function() {
+        try {
+          const tid = idForTexture(currentTexture);
+          if (tid != null && !textureInfoById.has(tid)) {
+            // texSubImage2D has different overloads; just record kind
+            textureInfoById.set(tid, { kind: 'sub-only', frameUploaded: stats.framesSeen });
+          }
+        } catch (e) {}
+        return origTexSubImage2D.apply(null, arguments);
+      };
+  
+      console.log('[HC-GLSpy] gl wrapped');
+    }
+  
+    // Wrap EVERY WebGL context the page asks for. The game may create multiple
+    // canvases (e.g. a hidden one for transport, the real game canvas later).
+    // Only the first wrap on a given gl object actually patches it (idempotent).
+    HTMLCanvasElement.prototype.getContext = function(type) {
+      const ctx = origGetContext.apply(this, arguments);
+      if (ctx && /webgl/i.test(type)) {
+        // Always remember the latest, BUT prefer big canvases (likely the game).
+        if (!glRef || (this.width >= 800 && this.height >= 500)) {
+          glRef = ctx;
+          canvasRef = this;
+        }
+        wrapGl(ctx);
+      }
+      return ctx;
+    };
+  
+    return {
+      getStats() {
+        return {
+          wrapped: stats.wrapped,
+          framesSeen: stats.framesSeen,
+          drawsLastFrame: stats.drawsLastFrame,
+          totalDraws: stats.totalDraws,
+          drawHistogram: stats.drawHistogram,
+          programIds: stats.programIds,
+          textureIds: stats.textureIds,
+          sampleCount: stats.samples.length,
+          samples: stats.samples,
+        };
+      },
+      resetSamples() { stats.samples = []; },
+      getGl() { return glRef; },
+      getCanvas() { return canvasRef; },
+      // Snapshot for current screen: which textures and programs the last frame
+      // used. Pair with HC_GLSpy.listTextures() to know what each texture is.
+      getFingerprint() {
+        const texList = [];
+        for (const [tid, count] of drawByTexLastFrame.entries()) {
+          const info = textureInfoById.get(tid) || null;
+          texList.push({ tex: tid, draws: count, info });
+        }
+        texList.sort((a, b) => b.draws - a.draws);
+        const progList = [];
+        for (const [pid, count] of drawByProgLastFrame.entries()) {
+          progList.push({ prog: pid, draws: count });
+        }
+        progList.sort((a, b) => b.draws - a.draws);
+        return { drawsLastFrame: stats.drawsLastFrame, framesSeen: stats.framesSeen, textures: texList, programs: progList };
+      },
+      listTextures() {
+        const out = [];
+        for (const [id, info] of textureInfoById.entries()) out.push({ id, ...info });
+        out.sort((a, b) => a.id - b.id);
+        return out;
+      },
+  
+      // Lightweight snapshot for diffing. Only carries texture IDs + per-tex
+      // draw counts + named-texture URLs (the stable bits across runs).
+      snapshot() {
+        const texs = {};
+        const named = {};
+        for (const [tid, count] of drawByTexLastFrame.entries()) {
+          texs[tid] = count;
+          const info = textureInfoById.get(tid);
+          if (info && info.src && info.src.indexOf('st-valley.redspell.ru/images/') >= 0) {
+            named[info.src.split('/').pop()] = count;
+          }
+        }
+        return {
+          draws: stats.drawsLastFrame,
+          framesSeen: stats.framesSeen,
+          texs,
+          named,
+        };
+      },
+  
+      // Diff two snapshots. Returns texs that appear in `curr` but not in `prev`
+      // (new), and texs whose draw count increased significantly.
+      diff(prev, curr) {
+        const newTexs = [];
+        const moreUsed = [];
+        for (const tid in curr.texs) {
+          const prevCount = prev.texs[tid] || 0;
+          const currCount = curr.texs[tid];
+          const info = textureInfoById.get(+tid);
+          const entry = {
+            tex: +tid, was: prevCount, now: currCount,
+            src: info && info.src ? info.src.split('/').pop() : null,
+            w: info && info.w, h: info && info.h, kind: info && info.kind,
+          };
+          if (prevCount === 0) newTexs.push(entry);
+          else if (currCount > prevCount) moreUsed.push(entry);
+        }
+        const newNamed = [];
+        for (const name in curr.named) {
+          if (!prev.named[name]) newNamed.push({ name, draws: curr.named[name] });
+        }
+        return {
+          drawsDelta: curr.draws - prev.draws,
+          newTexCount: newTexs.length,
+          newTexs,
+          moreUsed,
+          newNamed,
+        };
+      },
+  
+      // Accumulate texture IDs seen across the next `durationMs` of frames.
+      // Useful for catching transient pickup animations after a click.
+      async captureWindow(durationMs) {
+        const start = stats.framesSeen;
+        const seenTexs = new Map();    // tex -> max count in any single frame
+        const baseTexs = new Set(Object.keys(this.snapshot().texs).map(Number));
+        return new Promise(resolve => {
+          const tick = () => {
+            for (const [tid, count] of drawByTexLastFrame.entries()) {
+              const prev = seenTexs.get(tid) || 0;
+              if (count > prev) seenTexs.set(tid, count);
+            }
+            if (Date.now() - t0 < durationMs) setTimeout(tick, 16);
+            else {
+              const newTexs = [];
+              for (const [tid, count] of seenTexs.entries()) {
+                if (!baseTexs.has(tid)) {
+                  const info = textureInfoById.get(tid);
+                  newTexs.push({
+                    tex: tid, peakDraws: count,
+                    src: info && info.src ? info.src.split('/').pop() : null,
+                    w: info && info.w, h: info && info.h, kind: info && info.kind,
+                  });
+                }
+              }
+              resolve({
+                framesObserved: stats.framesSeen - start,
+                newTexs,
+                transientCount: newTexs.length,
+              });
+            }
+          };
+          const t0 = Date.now();
+          tick();
+        });
+      },
+    };
+  })();
+  }
+  
+
   // ═══ capture.js (eager) ═══
   // ── Canvas locator (was: WebGL frame capture) ──
   // Pivoted away from pixel capture — see doc/01-pixel-capture-attempt.md.
@@ -93,6 +408,53 @@
   if (window.HC_Scene) {
     console.log('[HC] Scene already installed — reusing.');
   } else {
+  
+  // ── Eager probe (option 3): catch the moment PIXI is assigned, wrap key
+  // constructors so we capture renderer/stage instances at birth. Runs at
+  // document_start, before game scripts.
+  (function installPixiTrap() {
+    if (window.__hcPixiTrap) return;
+    window.__hcPixiTrap = { renderers: [], stages: [], events: [] };
+    const T = window.__hcPixiTrap;
+  
+    function wrapPixi(P) {
+      if (!P || P.__hcWrapped) return;
+      P.__hcWrapped = true;
+      T.events.push({ t: Date.now(), e: 'pixi-detected', keys: Object.keys(P).length });
+  
+      const wrapCtor = (name) => {
+        const Orig = P[name];
+        if (typeof Orig !== 'function') return;
+        function Wrapped(...args) {
+          const inst = new Orig(...args);
+          try {
+            if (name === 'WebGLRenderer' || name === 'CanvasRenderer') T.renderers.push(inst);
+            if (name === 'Stage') T.stages.push(inst);
+            T.events.push({ t: Date.now(), e: 'ctor:' + name });
+          } catch (e) {}
+          return inst;
+        }
+        Wrapped.prototype = Orig.prototype;
+        Object.setPrototypeOf(Wrapped, Orig);
+        try { P[name] = Wrapped; } catch (e) {}
+      };
+      ['WebGLRenderer', 'CanvasRenderer', 'Stage'].forEach(wrapCtor);
+    }
+  
+    if (window.PIXI) {
+      wrapPixi(window.PIXI);
+    } else {
+      let _pixi;
+      try {
+        Object.defineProperty(window, 'PIXI', {
+          configurable: true,
+          get() { return _pixi; },
+          set(v) { _pixi = v; try { wrapPixi(v); } catch (e) {} },
+        });
+      } catch (e) { T.events.push({ t: Date.now(), e: 'defineProperty-failed', err: String(e) }); }
+    }
+  })();
+  
   window.HC_Scene = (function() {
     let pixiApp = null;
     let stage = null;
@@ -106,42 +468,72 @@
       // 1. PIXI Devtools convention: __PIXI_APP__ or __PIXI_DEVTOOLS_GLOBAL_HOOK__
       const knownGlobals = [
         '__PIXI_APP__', '__PIXI_RENDERER__', '__PIXI_STAGE__',
-        'app', 'game', 'pixiApp', '_app',
+        'app', 'game', 'pixiApp', '_app', 'stage',
       ];
       for (const k of knownGlobals) {
-        const v = window[k];
-        if (v && (v.stage || v.scene)) {
-          pixiApp = v;
-          return capture();
-        }
+        let v; try { v = window[k]; } catch (e) { continue; }
+        if (v && (v.stage || v.scene)) { pixiApp = v; return capture(); }
+        if (v && v.children && v.transform) { pixiApp = { stage: v, renderer: null }; return capture(); }
       }
   
-      // 2. Walk window properties for any object with .stage and .renderer
+      // 2. PIXI Devtools hook: __PIXI_DEVTOOLS_GLOBAL_HOOK__ collects registered apps.
       try {
-        for (const k of Object.keys(window)) {
-          if (k.startsWith('__hc')) continue; // skip our own
-          let v;
-          try { v = window[k]; } catch (e) { continue; }
-          if (v && typeof v === 'object' && v.stage && v.renderer) {
-            pixiApp = v;
+        const h = window.__PIXI_DEVTOOLS_GLOBAL_HOOK__;
+        if (h) {
+          const apps = h.apps || (h.app ? [h.app] : null);
+          if (apps && apps.length) { pixiApp = apps[0]; return capture(); }
+          if (h.renderers && h.renderers.length && h.stages && h.stages.length) {
+            pixiApp = { renderer: h.renderers[0], stage: h.stages[0] };
             return capture();
           }
         }
       } catch (e) {}
   
-      // 3. PIXI namespace exposed?
+      // 3. Walk window properties for any object with .stage and .renderer
+      try {
+        for (const k of Object.keys(window)) {
+          if (k.startsWith('__hc') || k.startsWith('HC_')) continue;
+          let v; try { v = window[k]; } catch (e) { continue; }
+          if (v && typeof v === 'object' && v.stage && v.renderer) {
+            pixiApp = v; return capture();
+          }
+        }
+      } catch (e) {}
+  
+      // 4. Canvas back-references — some PIXI apps store on the canvas element.
+      try {
+        const c = window.HC_Capture && window.HC_Capture.canvas;
+        if (c) {
+          for (const k of ['__pixi_app', '__pixiApp', '_pixiApp', 'pixiApp']) {
+            if (c[k]) { pixiApp = c[k]; return capture(); }
+          }
+          // WebGL context back-ref?
+          const gl = c._gl || (c.getContext && c.getContext('webgl'));
+          if (gl) {
+            for (const k of ['__pixi_renderer', 'renderer', '_renderer']) {
+              if (gl[k]) { pixiApp = { renderer: gl[k], stage: gl[k].lastObjectRendered || null }; return capture(); }
+            }
+          }
+        }
+      } catch (e) {}
+  
+      // 5. PIXI namespace exposed?
       if (window.PIXI) {
-        // Some apps store the renderer as PIXI.autoDetectRenderer's last result,
-        // or instances are tracked. Best-effort:
         const PIXI = window.PIXI;
         if (PIXI._app || PIXI.app) {
-          pixiApp = PIXI._app || PIXI.app;
-          return capture();
+          pixiApp = PIXI._app || PIXI.app; return capture();
         }
       }
   
-      // 4. Nothing found yet.
       return null;
+    }
+  
+    // Walk a known stage root from outside (used by eval probe).
+    function attachStage(s) {
+      if (!s) return false;
+      pixiApp = pixiApp || { stage: s, renderer: null };
+      stage = s;
+      return true;
     }
   
     function capture() {
@@ -243,6 +635,8 @@
       findByTexture,
       listTextures,
       describeNode,
+      attachStage,
+      walk,
     };
   })();
   }
@@ -860,6 +1254,70 @@
           case 'getCfg':       value = HC_CFG; break;
           case 'setCfg':       Object.assign(HC_CFG, args[0]); value = HC_CFG; break;
           // ── PIXI scene-graph probes ──
+          case 'eval': {
+            // Debug-only: evaluate arbitrary JS in iframe context. Returns serializable result.
+            // The arg is a string that will be wrapped in (function(){ return ... })().
+            const fn = new Function('HC_Scene', 'HC_Capture', 'HC_Vision', 'HC_Clicker', 'HC_Visit', 'HC_CFG', args[0]);
+            value = await Promise.resolve(fn(window.HC_Scene, window.HC_Capture, window.HC_Vision, window.HC_Clicker, window.HC_Visit, window.HC_CFG));
+            break;
+          }
+          case 'glSpy': value = HC_GLSpy.getStats(); break;
+          case 'glSpyReset': HC_GLSpy.resetSamples(); value = 'reset'; break;
+          case 'glSpyFp': value = HC_GLSpy.getFingerprint(); break;
+          case 'glSpyTextures': value = HC_GLSpy.listTextures(); break;
+          case 'glSnap': {
+            // Save a snapshot under a name. args: [name]
+            window.__hcSnaps = window.__hcSnaps || {};
+            window.__hcSnaps[args[0]] = HC_GLSpy.snapshot();
+            value = { saved: args[0], draws: window.__hcSnaps[args[0]].draws };
+            break;
+          }
+          case 'glDiff': {
+            // Diff named snapshot vs current. args: [name]
+            const prev = (window.__hcSnaps || {})[args[0]];
+            if (!prev) { value = { err: 'no snap named ' + args[0] }; break; }
+            value = HC_GLSpy.diff(prev, HC_GLSpy.snapshot());
+            break;
+          }
+          case 'glWindow': {
+            // Capture textures across N ms. args: [ms]
+            value = await HC_GLSpy.captureWindow(args[0] || 800);
+            break;
+          }
+          case 'clickAt': {
+            // Dispatch a click on the canvas at (x, y) in canvas coords.
+            const c = HC_Capture.canvas;
+            const r = c.getBoundingClientRect();
+            const sx = c.width / r.width, sy = c.height / r.height;
+            const o = { clientX: r.left + args[0] / sx, clientY: r.top + args[1] / sy, bubbles: true, cancelable: true, view: window };
+            c.dispatchEvent(new PointerEvent('pointerdown', o));
+            c.dispatchEvent(new MouseEvent('mousedown', o));
+            c.dispatchEvent(new PointerEvent('pointerup', o));
+            c.dispatchEvent(new MouseEvent('mouseup', o));
+            c.dispatchEvent(new MouseEvent('click', o));
+            value = { clickedAt: [args[0], args[1]] };
+            break;
+          }
+          case 'pixiTrap': {
+            const T = window.__hcPixiTrap;
+            if (!T) { value = { installed: false }; break; }
+            value = {
+              installed: true,
+              renderers: T.renderers.length,
+              stages: T.stages.length,
+              events: T.events.slice(-30),
+              firstRenderer: T.renderers[0] ? {
+                ctor: T.renderers[0].constructor.name,
+                w: T.renderers[0].width, h: T.renderers[0].height,
+                hasGl: !!T.renderers[0].gl,
+              } : null,
+              firstStage: T.stages[0] ? {
+                ctor: T.stages[0].constructor.name,
+                children: T.stages[0].children ? T.stages[0].children.length : null,
+              } : null,
+            };
+            break;
+          }
           case 'pixiDiscover': value = { found: !!HC_Scene.discover(), ready: HC_Scene.isReady() }; break;
           case 'pixiDeep': {
             const out = { hasPIXI: !!window.PIXI };

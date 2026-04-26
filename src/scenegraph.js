@@ -6,6 +6,53 @@
 if (window.HC_Scene) {
   console.log('[HC] Scene already installed — reusing.');
 } else {
+
+// ── Eager probe (option 3): catch the moment PIXI is assigned, wrap key
+// constructors so we capture renderer/stage instances at birth. Runs at
+// document_start, before game scripts.
+(function installPixiTrap() {
+  if (window.__hcPixiTrap) return;
+  window.__hcPixiTrap = { renderers: [], stages: [], events: [] };
+  const T = window.__hcPixiTrap;
+
+  function wrapPixi(P) {
+    if (!P || P.__hcWrapped) return;
+    P.__hcWrapped = true;
+    T.events.push({ t: Date.now(), e: 'pixi-detected', keys: Object.keys(P).length });
+
+    const wrapCtor = (name) => {
+      const Orig = P[name];
+      if (typeof Orig !== 'function') return;
+      function Wrapped(...args) {
+        const inst = new Orig(...args);
+        try {
+          if (name === 'WebGLRenderer' || name === 'CanvasRenderer') T.renderers.push(inst);
+          if (name === 'Stage') T.stages.push(inst);
+          T.events.push({ t: Date.now(), e: 'ctor:' + name });
+        } catch (e) {}
+        return inst;
+      }
+      Wrapped.prototype = Orig.prototype;
+      Object.setPrototypeOf(Wrapped, Orig);
+      try { P[name] = Wrapped; } catch (e) {}
+    };
+    ['WebGLRenderer', 'CanvasRenderer', 'Stage'].forEach(wrapCtor);
+  }
+
+  if (window.PIXI) {
+    wrapPixi(window.PIXI);
+  } else {
+    let _pixi;
+    try {
+      Object.defineProperty(window, 'PIXI', {
+        configurable: true,
+        get() { return _pixi; },
+        set(v) { _pixi = v; try { wrapPixi(v); } catch (e) {} },
+      });
+    } catch (e) { T.events.push({ t: Date.now(), e: 'defineProperty-failed', err: String(e) }); }
+  }
+})();
+
 window.HC_Scene = (function() {
   let pixiApp = null;
   let stage = null;
@@ -19,42 +66,72 @@ window.HC_Scene = (function() {
     // 1. PIXI Devtools convention: __PIXI_APP__ or __PIXI_DEVTOOLS_GLOBAL_HOOK__
     const knownGlobals = [
       '__PIXI_APP__', '__PIXI_RENDERER__', '__PIXI_STAGE__',
-      'app', 'game', 'pixiApp', '_app',
+      'app', 'game', 'pixiApp', '_app', 'stage',
     ];
     for (const k of knownGlobals) {
-      const v = window[k];
-      if (v && (v.stage || v.scene)) {
-        pixiApp = v;
-        return capture();
-      }
+      let v; try { v = window[k]; } catch (e) { continue; }
+      if (v && (v.stage || v.scene)) { pixiApp = v; return capture(); }
+      if (v && v.children && v.transform) { pixiApp = { stage: v, renderer: null }; return capture(); }
     }
 
-    // 2. Walk window properties for any object with .stage and .renderer
+    // 2. PIXI Devtools hook: __PIXI_DEVTOOLS_GLOBAL_HOOK__ collects registered apps.
     try {
-      for (const k of Object.keys(window)) {
-        if (k.startsWith('__hc')) continue; // skip our own
-        let v;
-        try { v = window[k]; } catch (e) { continue; }
-        if (v && typeof v === 'object' && v.stage && v.renderer) {
-          pixiApp = v;
+      const h = window.__PIXI_DEVTOOLS_GLOBAL_HOOK__;
+      if (h) {
+        const apps = h.apps || (h.app ? [h.app] : null);
+        if (apps && apps.length) { pixiApp = apps[0]; return capture(); }
+        if (h.renderers && h.renderers.length && h.stages && h.stages.length) {
+          pixiApp = { renderer: h.renderers[0], stage: h.stages[0] };
           return capture();
         }
       }
     } catch (e) {}
 
-    // 3. PIXI namespace exposed?
+    // 3. Walk window properties for any object with .stage and .renderer
+    try {
+      for (const k of Object.keys(window)) {
+        if (k.startsWith('__hc') || k.startsWith('HC_')) continue;
+        let v; try { v = window[k]; } catch (e) { continue; }
+        if (v && typeof v === 'object' && v.stage && v.renderer) {
+          pixiApp = v; return capture();
+        }
+      }
+    } catch (e) {}
+
+    // 4. Canvas back-references — some PIXI apps store on the canvas element.
+    try {
+      const c = window.HC_Capture && window.HC_Capture.canvas;
+      if (c) {
+        for (const k of ['__pixi_app', '__pixiApp', '_pixiApp', 'pixiApp']) {
+          if (c[k]) { pixiApp = c[k]; return capture(); }
+        }
+        // WebGL context back-ref?
+        const gl = c._gl || (c.getContext && c.getContext('webgl'));
+        if (gl) {
+          for (const k of ['__pixi_renderer', 'renderer', '_renderer']) {
+            if (gl[k]) { pixiApp = { renderer: gl[k], stage: gl[k].lastObjectRendered || null }; return capture(); }
+          }
+        }
+      }
+    } catch (e) {}
+
+    // 5. PIXI namespace exposed?
     if (window.PIXI) {
-      // Some apps store the renderer as PIXI.autoDetectRenderer's last result,
-      // or instances are tracked. Best-effort:
       const PIXI = window.PIXI;
       if (PIXI._app || PIXI.app) {
-        pixiApp = PIXI._app || PIXI.app;
-        return capture();
+        pixiApp = PIXI._app || PIXI.app; return capture();
       }
     }
 
-    // 4. Nothing found yet.
     return null;
+  }
+
+  // Walk a known stage root from outside (used by eval probe).
+  function attachStage(s) {
+    if (!s) return false;
+    pixiApp = pixiApp || { stage: s, renderer: null };
+    stage = s;
+    return true;
   }
 
   function capture() {
@@ -156,6 +233,8 @@ window.HC_Scene = (function() {
     findByTexture,
     listTextures,
     describeNode,
+    attachStage,
+    walk,
   };
 })();
 }

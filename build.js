@@ -12,7 +12,7 @@ const PASTE_OUT = path.join(__dirname, 'clicker.js');
 const EXT_OUT = path.join(__dirname, 'chrome-ext', 'iframe-script.js');
 
 // Load order matters: config → capture → vision → clicker → visit → ui
-const modules = ['config.js', 'capture.js', 'scenegraph.js', 'vision.js', 'clicker.js', 'visit.js', 'ui.js'];
+const modules = ['config.js', 'glspy.js', 'capture.js', 'scenegraph.js', 'vision.js', 'clicker.js', 'visit.js', 'ui.js'];
 
 function readModules() {
   return modules.map(file => ({
@@ -128,6 +128,70 @@ function buildExtBundle(mods) {
           case 'getCfg':       value = HC_CFG; break;
           case 'setCfg':       Object.assign(HC_CFG, args[0]); value = HC_CFG; break;
           // ── PIXI scene-graph probes ──
+          case 'eval': {
+            // Debug-only: evaluate arbitrary JS in iframe context. Returns serializable result.
+            // The arg is a string that will be wrapped in (function(){ return ... })().
+            const fn = new Function('HC_Scene', 'HC_Capture', 'HC_Vision', 'HC_Clicker', 'HC_Visit', 'HC_CFG', args[0]);
+            value = await Promise.resolve(fn(window.HC_Scene, window.HC_Capture, window.HC_Vision, window.HC_Clicker, window.HC_Visit, window.HC_CFG));
+            break;
+          }
+          case 'glSpy': value = HC_GLSpy.getStats(); break;
+          case 'glSpyReset': HC_GLSpy.resetSamples(); value = 'reset'; break;
+          case 'glSpyFp': value = HC_GLSpy.getFingerprint(); break;
+          case 'glSpyTextures': value = HC_GLSpy.listTextures(); break;
+          case 'glSnap': {
+            // Save a snapshot under a name. args: [name]
+            window.__hcSnaps = window.__hcSnaps || {};
+            window.__hcSnaps[args[0]] = HC_GLSpy.snapshot();
+            value = { saved: args[0], draws: window.__hcSnaps[args[0]].draws };
+            break;
+          }
+          case 'glDiff': {
+            // Diff named snapshot vs current. args: [name]
+            const prev = (window.__hcSnaps || {})[args[0]];
+            if (!prev) { value = { err: 'no snap named ' + args[0] }; break; }
+            value = HC_GLSpy.diff(prev, HC_GLSpy.snapshot());
+            break;
+          }
+          case 'glWindow': {
+            // Capture textures across N ms. args: [ms]
+            value = await HC_GLSpy.captureWindow(args[0] || 800);
+            break;
+          }
+          case 'clickAt': {
+            // Dispatch a click on the canvas at (x, y) in canvas coords.
+            const c = HC_Capture.canvas;
+            const r = c.getBoundingClientRect();
+            const sx = c.width / r.width, sy = c.height / r.height;
+            const o = { clientX: r.left + args[0] / sx, clientY: r.top + args[1] / sy, bubbles: true, cancelable: true, view: window };
+            c.dispatchEvent(new PointerEvent('pointerdown', o));
+            c.dispatchEvent(new MouseEvent('mousedown', o));
+            c.dispatchEvent(new PointerEvent('pointerup', o));
+            c.dispatchEvent(new MouseEvent('mouseup', o));
+            c.dispatchEvent(new MouseEvent('click', o));
+            value = { clickedAt: [args[0], args[1]] };
+            break;
+          }
+          case 'pixiTrap': {
+            const T = window.__hcPixiTrap;
+            if (!T) { value = { installed: false }; break; }
+            value = {
+              installed: true,
+              renderers: T.renderers.length,
+              stages: T.stages.length,
+              events: T.events.slice(-30),
+              firstRenderer: T.renderers[0] ? {
+                ctor: T.renderers[0].constructor.name,
+                w: T.renderers[0].width, h: T.renderers[0].height,
+                hasGl: !!T.renderers[0].gl,
+              } : null,
+              firstStage: T.stages[0] ? {
+                ctor: T.stages[0].constructor.name,
+                children: T.stages[0].children ? T.stages[0].children.length : null,
+              } : null,
+            };
+            break;
+          }
           case 'pixiDiscover': value = { found: !!HC_Scene.discover(), ready: HC_Scene.isReady() }; break;
           case 'pixiDeep': {
             const out = { hasPIXI: !!window.PIXI };
@@ -257,7 +321,7 @@ function buildExtBundle(mods) {
   // Eager modules: run immediately at document_start. config has no DOM deps;
   // capture is a thin canvas locator; scenegraph installs no hooks but is safe
   // to load early so its discover() can run any time.
-  const eagerFiles = new Set(['config.js', 'capture.js', 'scenegraph.js']);
+  const eagerFiles = new Set(['config.js', 'glspy.js', 'capture.js', 'scenegraph.js']);
   const eagerMods = mods.filter(m => eagerFiles.has(m.file));
   const lazyMods = mods.filter(m => !eagerFiles.has(m.file));
 
