@@ -12,7 +12,7 @@ const PASTE_OUT = path.join(__dirname, 'clicker.js');
 const EXT_OUT = path.join(__dirname, 'chrome-ext', 'iframe-script.js');
 
 // Load order matters: config → capture → vision → clicker → visit → ui
-const modules = ['config.js', 'glspy.js', 'capture.js', 'scenegraph.js', 'vision.js', 'clicker.js', 'visit.js', 'ui.js'];
+const modules = ['config.js', 'glspy.js', 'network.js', 'capture.js', 'scenegraph.js', 'vision.js', 'clicker.js', 'visit.js', 'ui.js'];
 
 function readModules() {
   return modules.map(file => ({
@@ -158,6 +158,12 @@ function buildExtBundle(mods) {
             value = await HC_GLSpy.captureWindow(args[0] || 800);
             break;
           }
+          case 'netStats':     value = HC_Net ? HC_Net.getStats() : { err: 'no HC_Net' }; break;
+          case 'netAwait':     value = HC_Net ? await HC_Net.awaitNextResponse(args[0] || 800) : 'no HC_Net'; break;
+          case 'visitProbe':   value = HC_Visit ? await HC_Visit.probeCell(args[0], args[1]) : 'no HC_Visit'; break;
+          case 'visitSweep':   value = HC_Visit ? await HC_Visit.sweepOnce() : 'no HC_Visit'; break;
+          case 'visitSetNextOk': HC_Visit.setNextOkBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
+          case 'visitSetTravels': HC_Visit.setTravelsBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
           case 'clickAt': {
             // Dispatch a click on the canvas at (x, y) in canvas coords.
             const c = HC_Capture.canvas;
@@ -321,7 +327,7 @@ function buildExtBundle(mods) {
   // Eager modules: run immediately at document_start. config has no DOM deps;
   // capture is a thin canvas locator; scenegraph installs no hooks but is safe
   // to load early so its discover() can run any time.
-  const eagerFiles = new Set(['config.js', 'glspy.js', 'capture.js', 'scenegraph.js']);
+  const eagerFiles = new Set(['config.js', 'glspy.js', 'network.js', 'capture.js', 'scenegraph.js']);
   const eagerMods = mods.filter(m => eagerFiles.has(m.file));
   const lazyMods = mods.filter(m => !eagerFiles.has(m.file));
 

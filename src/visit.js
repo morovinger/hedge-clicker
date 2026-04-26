@@ -1,46 +1,54 @@
-// ── Visit Loop: auto-traverse "Путешествия" friend farms ──
-// Flow:
-//   1. User opens Путешествия → clicks "В путь!" → enters first friend's farm
-//   2. HC_Visit takes over: clicks purple badges
-//   3. When no purple found for `idleScansToExit` scans → clicks "Домой"
-//   4. Game auto-advances to next friend farm; loop continues
-//   5. When all bars fill, game returns to TRAVELS_HUB. We detect by absence
-//      of purple AND repeated "Домой" clicks doing nothing → stop.
+// ── HC_Visit: hybrid auto-collect on friend farms ──
+// Drives the game by dispatching synthetic pointer events on the canvas
+// (proven to work — see exit-popup capture). Uses HC_Net's success oracle
+// (next /proto.html response after click → 0x80 = collect succeeded) to
+// distinguish real resource clicks from grass.
+//
+// Requires user to be inside a friend farm before start(). The "next farm"
+// popup confirm + main-farm "Путешествия" entry will be wired once we have
+// their canvas coords.
 
+if (window.HC_Visit) {
+  console.log('[HC] Visit already installed — reusing.');
+} else {
 window.HC_Visit = (function() {
   const cap = window.HC_Capture;
-  const vis = window.HC_Vision;
-  const cfg = window.HC_CFG;
-  const clicker = window.HC_Clicker;
+  const net = window.HC_Net;
   const canvas = cap.canvas;
 
-  // Canvas-relative coords for static UI buttons.
-  // Calibrate via Pick Target if your canvas is non-standard.
+  // Static UI button coords (canvas-relative, 1000×700).
   const BTN = {
-    home:   { x: 80,  y: 660 }, // "Домой" / "На ферму" — bottom-left blue
-    voyage: { x: 765, y: 260 }, // "В путь!" — only on TRAVELS_HUB
+    home:     { x: 80,  y: 660 }, // "Домой" — bottom-left, returns from friend farm
+    voyage:   { x: 765, y: 260 }, // "В путь!" on TRAVELS_HUB
+    travels:  { x: 0,   y: 0   }, // "Путешествия" on main farm — TBD
+    nextOk:   { x: 0,   y: 0   }, // confirm button on "next farm" popup — TBD
   };
 
+  // Coarse grid covering the playable area, skipping top/bottom UI bands.
+  // 9 cols × 5 rows = 45 cells; ~120 px spacing covers most resource sprites.
+  const GRID_X = [125, 235, 345, 455, 565, 675, 785, 850, 925];
+  const GRID_Y = [180, 285, 390, 495, 595];
+
   const VCFG = {
-    scanInterval: 1200,        // ms between scans inside friend farm
-    clickDelay: 350,           // ms between badge clicks
-    idleScansToExit: 3,        // empty scans before clicking "Домой"
-    homeWait: 2500,            // ms to wait after "Домой" for next farm to load
-    maxHomeRetries: 3,         // if "Домой" doesn't change state (still empty), assume hub → stop
-    yOffset: 10,               // click slightly below badge (hits house body)
+    clickWait:        700,   // ms to await /proto.html response after a click
+    repeatGap:        450,   // ms between repeat clicks on a confirmed cell
+    maxRepeats:       5,     // tap a confirmed cell up to N times
+    interCellGap:     200,   // ms between distinct cells
+    homeWait:         2500,  // ms after clicking home (popup may appear)
+    maxEmptyPasses:   2,     // give up after this many sweeps with zero hits
   };
 
   let running = false;
-  let emptyScans = 0;
-  let homeRetries = 0;
-  let visited = 0;
-  let cycleClicks = 0;
+  let stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null };
 
   function click(cx, cy) {
     const rect = canvas.getBoundingClientRect();
     const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
-    const clientX = rect.left + cx / sx, clientY = rect.top + cy / sy;
-    const o = { clientX, clientY, bubbles: true, cancelable: true, view: window };
+    const o = {
+      clientX: rect.left + cx / sx, clientY: rect.top + cy / sy,
+      bubbles: true, cancelable: true, view: window,
+      button: 0, pointerType: 'mouse', pointerId: 1, isPrimary: true,
+    };
     canvas.dispatchEvent(new PointerEvent('pointerdown', o));
     canvas.dispatchEvent(new MouseEvent('mousedown', o));
     canvas.dispatchEvent(new PointerEvent('pointerup', o));
@@ -48,78 +56,90 @@ window.HC_Visit = (function() {
     canvas.dispatchEvent(new MouseEvent('click', o));
   }
 
-  function step() {
-    if (!running) return;
-    cap.requestFrame();
-    setTimeout(() => {
-      const detected = vis.scanFrame(cap.getFrame(), cfg);
-      if (window.HC_UI) window.HC_UI.updateInfo({
-        clicks: cycleClicks, scans: 0, found: detected.length,
-        detected, running, mode: 'visit',
-      });
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-      if (detected.length > 0) {
-        emptyScans = 0;
-        homeRetries = 0;
-        let i = 0;
-        (function next() {
-          if (!running || i >= detected.length) {
-            window.__hcTimer = setTimeout(step, VCFG.scanInterval);
-            return;
+  // Returns 'ok' | 'err' | 'none' — see HC_Net.awaitNextResponse.
+  async function probe(x, y) {
+    stats.attempts++;
+    click(x, y);
+    return await net.awaitNextResponse(VCFG.clickWait);
+  }
+
+  async function farmPass() {
+    let hits = 0;
+    for (const y of GRID_Y) {
+      for (const x of GRID_X) {
+        if (!running) return hits;
+        const r = await probe(x, y);
+        if (r === 'ok') {
+          hits++; stats.hits++; stats.lastResult = 'ok@' + x + ',' + y;
+          // Multi-click the same spot — a tree usually needs 3-5 hits
+          for (let i = 0; i < VCFG.maxRepeats - 1; i++) {
+            if (!running) return hits;
+            await sleep(VCFG.repeatGap);
+            const r2 = await probe(x, y);
+            if (r2 !== 'ok') break;
+            hits++; stats.hits++;
           }
-          click(detected[i].x, detected[i].y + VCFG.yOffset);
-          cycleClicks++;
-          i++;
-          setTimeout(next, VCFG.clickDelay);
-        })();
-        return;
+        }
+        await sleep(VCFG.interCellGap);
       }
+    }
+    return hits;
+  }
 
-      // No badges visible
-      emptyScans++;
-      if (emptyScans < VCFG.idleScansToExit) {
-        window.__hcTimer = setTimeout(step, VCFG.scanInterval);
-        return;
+  async function loop() {
+    let emptyPasses = 0;
+    while (running) {
+      const hits = await farmPass();
+      stats.passes++;
+      if (hits === 0) {
+        emptyPasses++;
+        if (emptyPasses >= VCFG.maxEmptyPasses) {
+          console.log('[HC_Visit] No hits for', VCFG.maxEmptyPasses, 'passes — trying home button');
+          click(BTN.home.x, BTN.home.y);
+          stats.farms++;
+          await sleep(VCFG.homeWait);
+          // Auto-confirm popup if coords set
+          if (BTN.nextOk.x || BTN.nextOk.y) {
+            click(BTN.nextOk.x, BTN.nextOk.y);
+            await sleep(VCFG.homeWait);
+          }
+          emptyPasses = 0;
+        }
+      } else {
+        emptyPasses = 0;
       }
-
-      // Try to advance to next farm
-      if (homeRetries >= VCFG.maxHomeRetries) {
-        console.log('[HC_Visit] Bars likely full — stopping. Visited:', visited, 'clicks:', cycleClicks);
-        stop();
-        return;
-      }
-      console.log('[HC_Visit] No targets, clicking Домой (retry', homeRetries + 1, ')');
-      click(BTN.home.x, BTN.home.y);
-      homeRetries++;
-      visited++;
-      emptyScans = 0;
-      window.__hcTimer = setTimeout(step, VCFG.homeWait);
-    }, 200);
+    }
   }
 
   function start() {
     if (running) return;
-    if (clicker && clicker.isRunning()) clicker.stop();
+    if (!net) { console.error('[HC_Visit] HC_Net missing — cannot start'); return; }
     running = true;
-    emptyScans = 0; homeRetries = 0; visited = 0; cycleClicks = 0;
-    console.log('[HC_Visit] START — make sure you are inside a friend farm or on TRAVELS_HUB');
-    step();
+    stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null };
+    console.log('[HC_Visit] START — assumes you are inside a friend farm');
+    loop();
   }
 
   function stop() {
-    if (!running) return;
     running = false;
-    clearTimeout(window.__hcTimer);
-    if (window.HC_UI && window.HC_UI.updateVisitUI) window.HC_UI.updateVisitUI();
+    console.log('[HC_Visit] STOP', stats);
   }
 
   return {
     start, stop,
     toggle() { running ? stop() : start(); },
     isRunning() { return running; },
-    getStats() { return { visited, cycleClicks, running }; },
+    getStats() { return Object.assign({ running }, stats); },
     getButtons() { return BTN; },
-    setHomeBtn(x, y) { BTN.home.x = x; BTN.home.y = y; },
-    setVoyageBtn(x, y) { BTN.voyage.x = x; BTN.voyage.y = y; },
+    setHomeBtn(x, y)    { BTN.home.x = x; BTN.home.y = y; },
+    setVoyageBtn(x, y)  { BTN.voyage.x = x; BTN.voyage.y = y; },
+    setNextOkBtn(x, y)  { BTN.nextOk.x = x; BTN.nextOk.y = y; },
+    setTravelsBtn(x, y) { BTN.travels.x = x; BTN.travels.y = y; },
+    // Manual one-shot helpers for calibration/testing
+    probeCell: probe,
+    sweepOnce: farmPass,
   };
 })();
+}
