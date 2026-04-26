@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Hedgehog Vision",
+  "version": "0.1.0",
+  "description": "Auto-injects vision-based auto-clicker into the Ёжики game iframe.",
+  "content_scripts": [
+    {
+      "matches": ["https://valley.redspell.ru/*"],
+      "js": ["iframe-script.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "host_permissions": ["https://valley.redspell.ru/*"]
+}

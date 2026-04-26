@@ -6,6 +6,16 @@ Hooks into the game's WebGL renderer to capture frame pixels mid-draw, detects r
 
 ## Quick Start
 
+Two ways to use it:
+
+### Option A — Chrome extension (recommended)
+
+1. `node build.js`
+2. Open `chrome://extensions`, enable Developer mode, click **Load unpacked**, select `chrome-ext/`.
+3. Open https://vk.com/ezhiky_game — panel appears automatically. See `chrome-ext/README.md` for the postMessage bridge.
+
+### Option B — Manual paste
+
 1. Open https://vk.com/ezhiky_game
 2. Press **F12** → Console tab
 3. Switch context from `top` to the `valley.redspell.ru` iframe
@@ -54,9 +64,14 @@ src/
   capture.js   — WebGL frame capture (drawElements hook)
   vision.js    — HSL color detection + pixel clustering
   clicker.js   — Click simulation & auto-collect loops
+  visit.js     — "Путешествия" multi-farm visit loop
   ui.js        — Draggable control panel
-build.js       — Concatenates src/ into injectable clicker.js
-clicker.js     — Built output (paste this into console)
+chrome-ext/
+  manifest.json
+  iframe-script.js — Built ext content script (auto-injects into game iframe)
+  README.md        — Install + postMessage bridge docs
+build.js       — Concatenates src/ → both clicker.js and chrome-ext/iframe-script.js
+clicker.js     — Built paste-into-console bundle
 ```
 
 ## Build
