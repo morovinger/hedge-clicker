@@ -1,5 +1,5 @@
 // Hedgehog Vision — Chrome extension content script (auto-injected into game iframe)
-// Built: 2026-04-26
+// Built: 2026-04-27
 // Runs at document_start in MAIN world inside https://valley.redspell.ru/play/vk/index.html
 
 (function() {
@@ -371,6 +371,31 @@
     let totalOk = 0, totalErr = 0, totalSeen = 0;
     let lastOkAt = 0, lastErrAt = 0, lastResponseAt = 0;
   
+    // Ring buffer of recent (request, response) pairs for offline decoding.
+    const RING_MAX = 32;
+    const ring = [];
+    let seq = 0;
+  
+    function pushRing(entry) {
+      entry.seq = ++seq;
+      ring.push(entry);
+      if (ring.length > RING_MAX) ring.shift();
+    }
+  
+    function bodyToBytes(body) {
+      if (body == null) return null;
+      try {
+        if (body instanceof ArrayBuffer) return Array.from(new Uint8Array(body));
+        if (ArrayBuffer.isView(body)) return Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+        if (typeof body === 'string') {
+          const out = new Array(body.length);
+          for (let i = 0; i < body.length; i++) out[i] = body.charCodeAt(i) & 0xff;
+          return out;
+        }
+      } catch (e) {}
+      return null;
+    }
+  
     if (!XMLHttpRequest.prototype.__hcNetWrapped) {
       XMLHttpRequest.prototype.__hcNetWrapped = true;
       const origOpen = XMLHttpRequest.prototype.open;
@@ -378,27 +403,45 @@
   
       XMLHttpRequest.prototype.open = function(method, url) {
         this.__hcIsProto = (typeof url === 'string' && url.indexOf('/proto.html') >= 0);
+        this.__hcUrl = url;
+        this.__hcMethod = method;
         return origOpen.apply(this, arguments);
       };
       XMLHttpRequest.prototype.send = function(body) {
         if (this.__hcIsProto) {
           // Force binary so we can read the opcode bytes
           try { if (!this.responseType) this.responseType = 'arraybuffer'; } catch (e) {}
+          const reqAt = Date.now();
+          const reqBytes = bodyToBytes(body);
+          const reqUrl = this.__hcUrl;
           this.addEventListener('load', () => {
             totalSeen++;
             lastResponseAt = Date.now();
+            let ok = false;
+            let respBytes = null;
             try {
-              if (!(this.response instanceof ArrayBuffer)) return;
-              const u8 = new Uint8Array(this.response);
-              // Success envelope starts with 0x80 0x00; error with 0x00 0x00
-              if (u8.length >= 2 && u8[0] === 0x80 && u8[1] === 0x00) {
-                totalOk++;
-                lastOkAt = lastResponseAt;
-              } else {
-                totalErr++;
-                lastErrAt = lastResponseAt;
+              if (this.response instanceof ArrayBuffer) {
+                respBytes = Array.from(new Uint8Array(this.response));
+                // 0x50 0x00 ('P\0') is the click-acknowledged envelope
+                // (action produced game state change). 0x30 0x00 ('0\0')
+                // is the background-tick envelope (no action). We want
+                // only the former as the success oracle.
+                if (respBytes.length >= 2 && respBytes[0] === 0x50 && respBytes[1] === 0x00) {
+                  ok = true;
+                }
               }
             } catch (e) {}
+            if (ok) { totalOk++; lastOkAt = lastResponseAt; }
+            else    { totalErr++; lastErrAt = lastResponseAt; }
+            pushRing({
+              url: reqUrl,
+              reqAt, respAt: lastResponseAt,
+              ok,
+              reqLen: reqBytes ? reqBytes.length : 0,
+              respLen: respBytes ? respBytes.length : 0,
+              req: reqBytes,
+              resp: respBytes,
+            });
           });
         }
         return origSend.apply(this, arguments);
@@ -424,16 +467,104 @@
       });
     }
   
+    // Return last N entries. opts: { withBytes: bool, n: number, minRespLen: number, sinceMs: number }
+    // When withBytes=false (default) returns metadata only — keeps payloads
+    // small. When true, includes req/resp byte arrays for offline decoding.
+    function dump(opts) {
+      opts = opts || {};
+      const n = opts.n || 8;
+      const since = opts.sinceMs ? Date.now() - opts.sinceMs : 0;
+      const min = opts.minRespLen || 0;
+      let out = ring.filter(e => e.respAt >= since && e.respLen >= min);
+      out = out.slice(-n);
+      if (!opts.withBytes) {
+        return out.map(e => ({
+          seq: e.seq, url: e.url, reqAt: e.reqAt, respAt: e.respAt,
+          ok: e.ok, reqLen: e.reqLen, respLen: e.respLen,
+        }));
+      }
+      return out;
+    }
+  
+    function clearRing() { ring.length = 0; }
+  
     return {
       awaitNextResponse,
       getStats() {
-        return { totalSeen, totalOk, totalErr, lastOkAt, lastErrAt, lastResponseAt };
+        return { totalSeen, totalOk, totalErr, lastOkAt, lastErrAt, lastResponseAt, ringLen: ring.length };
       },
+      dump,
+      clearRing,
       // Cheap "did anything succeed in the last N ms?" — useful for a passive
       // sanity check after a known game action.
       wasRecentSuccess(sinceMs) { return Date.now() - lastOkAt < sinceMs; },
       wasRecentError(sinceMs)   { return Date.now() - lastErrAt < sinceMs; },
     };
+  })();
+  }
+  
+
+  // ═══ dbgclick.js (eager) ═══
+  // ── HC_DbgClick: trusted clicks via chrome.debugger ──
+  // PIXI's interaction manager ignores synthetic events (isTrusted: false),
+  // so we route clicks through the extension's chrome.debugger channel
+  // which produces real OS-level events.
+  //
+  // MAIN-world side: post {type:'HC_DBG_CLICK_REQ', id, x, y} on this window.
+  // ISOLATED-world bridge (iframe-isolated.js) forwards to the background
+  // service worker (background.js) which calls Input.dispatchMouseEvent.
+  //
+  // Coordinates are in the iframe's CSS viewport, which on this game is
+  // 1:1 with canvas pixels (canvas at (0,0), no scaling).
+  
+  if (window.HC_DbgClick) {
+    console.log('[HC] DbgClick already installed — reusing.');
+  } else {
+  window.HC_DbgClick = (function() {
+    const pending = new Map();
+    let nextId = 1;
+    let available = null; // null = unknown, true/false set after first ping
+  
+    window.addEventListener('message', function(ev) {
+      const m = ev.data;
+      if (!m || typeof m !== 'object') return;
+      if (m.type === 'HC_DBG_CLICK_RES' || m.type === 'HC_DBG_PING_RES' || m.type === 'HC_DBG_TARGETS_RES') {
+        const cb = pending.get(m.id);
+        if (cb) { pending.delete(m.id); cb(m); }
+      }
+    });
+  
+    function send(type, payload, timeoutMs) {
+      return new Promise(function(resolve) {
+        const id = nextId++;
+        pending.set(id, resolve);
+        window.postMessage(Object.assign({ type, id }, payload), '*');
+        setTimeout(function() {
+          if (pending.has(id)) { pending.delete(id); resolve({ timeout: true }); }
+        }, timeoutMs || 2000);
+      });
+    }
+  
+    // Fire a click; returns Promise<{ok, error?}>. The caller usually
+    // doesn't await (visit.js spaces clicks by clickGap), but await-able
+    // for debugging.
+    function click(x, y) {
+      return send('HC_DBG_CLICK_REQ', { x, y }, 3000);
+    }
+  
+    // One-shot probe: asks the bridge to ensure the debugger is attached.
+    // Returns the result; also memoizes `available`.
+    async function probe() {
+      const r = await send('HC_DBG_PING_REQ', {}, 3000);
+      available = !!(r && r.resp && r.resp.ok);
+      return r;
+    }
+  
+    function isAvailable() { return available; }
+  
+    function listTargets() { return send('HC_DBG_TARGETS_REQ', {}, 3000); }
+  
+    return { click, probe, isAvailable, listTargets };
   })();
   }
   
@@ -965,31 +1096,51 @@
     
       // Static UI button coords (canvas-relative, 1000×700).
       const BTN = {
-        home:     { x: 80,  y: 660 }, // "Домой" — bottom-left, returns from friend farm
+        home:     { x: 80,  y: 660 }, // "Выйти" — bottom-left, returns from friend farm
+        next:     { x: 0,   y: 0   }, // "Далее" — bottom (right of home), advances to next friend farm. SET via setNextBtn
         voyage:   { x: 765, y: 260 }, // "В путь!" on TRAVELS_HUB
         travels:  { x: 0,   y: 0   }, // "Путешествия" on main farm — TBD
-        nextOk:   { x: 0,   y: 0   }, // confirm button on "next farm" popup — TBD
+        sessionEndOk: { x: 0, y: 0 }, // confirm on "backpack full" dialog — TBD
       };
     
-      // Coarse grid covering the playable area, skipping top/bottom UI bands.
-      // 9 cols × 5 rows = 45 cells; ~120 px spacing covers most resource sprites.
-      const GRID_X = [125, 235, 345, 455, 565, 675, 785, 850, 925];
-      const GRID_Y = [180, 285, 390, 495, 595];
+      // Dense grid covering the playable area, skipping top/bottom UI bands.
+      // 14 cols × 9 rows = 126 cells; ~70px spacing — small enough to hit
+      // most resource sprites which appear ~50-90px wide.
+      const GRID_X = [];
+      const GRID_Y = [];
+      for (let x = 80; x <= 940; x += 70) GRID_X.push(x);  // 14 cols
+      for (let y = 130; y <= 620; y += 70) GRID_Y.push(y); // 9 rows
     
       const VCFG = {
-        clickWait:        700,   // ms to await /proto.html response after a click
-        repeatGap:        450,   // ms between repeat clicks on a confirmed cell
-        maxRepeats:       5,     // tap a confirmed cell up to N times
-        interCellGap:     200,   // ms between distinct cells
-        homeWait:         2500,  // ms after clicking home (popup may appear)
-        maxEmptyPasses:   2,     // give up after this many sweeps with zero hits
+        clickGap:         300,   // ms between blind clicks during a sweep (no per-cell await)
+        settleAfterSweep: 1800,  // ms to wait after sweep for last responses to arrive
+        advanceWait:      2500,  // ms after clicking "Далее"/"Выйти" for next farm to load
+        maxSweepsPerFarm: 4,     // bound how many full passes we do per farm
+        // Threshold: net.totalOk delta from one sweep that counts as "real
+        // collection". Below this, we treat the sweep as failed (probably just
+        // background polls) and advance to the next farm. Tuned for ~38s sweep
+        // time during which the game emits maybe 1-2 unrelated polls.
+        minOkPerSweep:    3,
       };
     
       let running = false;
-      let stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null };
+      let stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null, hitCoords: [] };
     
       function click(cx, cy) {
+        // Prefer chrome.debugger backend (trusted events). Falls back to
+        // synthetic dispatch only if the extension bridge isn't installed
+        // — synthetic clicks are silently dropped by PIXI on this game.
         const rect = canvas.getBoundingClientRect();
+        if (window.HC_DbgClick) {
+          // Canvas sits at iframe origin and is 1:1 with viewport (verified:
+          // rectL=0, rectT=0, rectW=canvas.width). If that ever changes,
+          // translate here.
+          const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
+          const vx = rect.left + cx / sx;
+          const vy = rect.top + cy / sy;
+          window.HC_DbgClick.click(vx, vy);
+          return;
+        }
         const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
         const o = {
           clientX: rect.left + cx / sx, clientY: rect.top + cy / sy,
@@ -1005,57 +1156,47 @@
     
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     
-      // Returns 'ok' | 'err' | 'none' — see HC_Net.awaitNextResponse.
-      async function probe(x, y) {
-        stats.attempts++;
-        click(x, y);
-        return await net.awaitNextResponse(VCFG.clickWait);
-      }
-    
-      async function farmPass() {
-        let hits = 0;
+      // Blind sweep: fire all 126 cells with `clickGap` between each. No per-cell
+      // oracle wait — instead we measure net.totalOk delta after the sweep
+      // settles. The raw clicks themselves are reliable; only our per-cell
+      // timing window was flaky.
+      // forStop: honor running flag for early termination (true for loop,
+      // false for one-off sweepOnce).
+      async function farmPass(forStop) {
+        const okBefore = net.getStats().totalOk;
         for (const y of GRID_Y) {
           for (const x of GRID_X) {
-            if (!running) return hits;
-            const r = await probe(x, y);
-            if (r === 'ok') {
-              hits++; stats.hits++; stats.lastResult = 'ok@' + x + ',' + y;
-              // Multi-click the same spot — a tree usually needs 3-5 hits
-              for (let i = 0; i < VCFG.maxRepeats - 1; i++) {
-                if (!running) return hits;
-                await sleep(VCFG.repeatGap);
-                const r2 = await probe(x, y);
-                if (r2 !== 'ok') break;
-                hits++; stats.hits++;
-              }
-            }
-            await sleep(VCFG.interCellGap);
+            if (forStop && !running) break;
+            click(x, y);
+            stats.attempts++;
+            await sleep(VCFG.clickGap);
           }
+          if (forStop && !running) break;
         }
-        return hits;
+        // Let final responses arrive
+        await sleep(VCFG.settleAfterSweep);
+        const okAfter = net.getStats().totalOk;
+        const gained = okAfter - okBefore;
+        stats.hits += gained;
+        stats.lastResult = 'sweep+' + gained;
+        return gained;
       }
     
       async function loop() {
-        let emptyPasses = 0;
+        let sweepsThisFarm = 0;
         while (running) {
-          const hits = await farmPass();
+          const gained = await farmPass(true);
           stats.passes++;
-          if (hits === 0) {
-            emptyPasses++;
-            if (emptyPasses >= VCFG.maxEmptyPasses) {
-              console.log('[HC_Visit] No hits for', VCFG.maxEmptyPasses, 'passes — trying home button');
-              click(BTN.home.x, BTN.home.y);
-              stats.farms++;
-              await sleep(VCFG.homeWait);
-              // Auto-confirm popup if coords set
-              if (BTN.nextOk.x || BTN.nextOk.y) {
-                click(BTN.nextOk.x, BTN.nextOk.y);
-                await sleep(VCFG.homeWait);
-              }
-              emptyPasses = 0;
-            }
-          } else {
-            emptyPasses = 0;
+          sweepsThisFarm++;
+          console.log('[HC_Visit] Sweep', sweepsThisFarm, '→ net oks gained:', gained);
+          // Advance if: didn't collect enough OR hit per-farm cap
+          if (gained < VCFG.minOkPerSweep || sweepsThisFarm >= VCFG.maxSweepsPerFarm) {
+            console.log('[HC_Visit] Advancing farm — total sweeps:', sweepsThisFarm);
+            const target = (BTN.next.x || BTN.next.y) ? BTN.next : BTN.home;
+            click(target.x, target.y);
+            stats.farms++;
+            await sleep(VCFG.advanceWait);
+            sweepsThisFarm = 0;
           }
         }
       }
@@ -1064,7 +1205,7 @@
         if (running) return;
         if (!net) { console.error('[HC_Visit] HC_Net missing — cannot start'); return; }
         running = true;
-        stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null };
+        stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null, hitCoords: [] };
         console.log('[HC_Visit] START — assumes you are inside a friend farm');
         loop();
       }
@@ -1080,12 +1221,12 @@
         isRunning() { return running; },
         getStats() { return Object.assign({ running }, stats); },
         getButtons() { return BTN; },
-        setHomeBtn(x, y)    { BTN.home.x = x; BTN.home.y = y; },
-        setVoyageBtn(x, y)  { BTN.voyage.x = x; BTN.voyage.y = y; },
-        setNextOkBtn(x, y)  { BTN.nextOk.x = x; BTN.nextOk.y = y; },
-        setTravelsBtn(x, y) { BTN.travels.x = x; BTN.travels.y = y; },
-        // Manual one-shot helpers for calibration/testing
-        probeCell: probe,
+        setHomeBtn(x, y)         { BTN.home.x = x; BTN.home.y = y; },
+        setNextBtn(x, y)         { BTN.next.x = x; BTN.next.y = y; },
+        setVoyageBtn(x, y)       { BTN.voyage.x = x; BTN.voyage.y = y; },
+        setTravelsBtn(x, y)      { BTN.travels.x = x; BTN.travels.y = y; },
+        setSessionEndOkBtn(x, y) { BTN.sessionEndOk.x = x; BTN.sessionEndOk.y = y; },
+        // Manual one-shot helper for calibration/testing
         sweepOnce: farmPass,
       };
     })();
@@ -1391,10 +1532,24 @@
           }
           case 'netStats':     value = HC_Net ? HC_Net.getStats() : { err: 'no HC_Net' }; break;
           case 'netAwait':     value = HC_Net ? await HC_Net.awaitNextResponse(args[0] || 800) : 'no HC_Net'; break;
-          case 'visitProbe':   value = HC_Visit ? await HC_Visit.probeCell(args[0], args[1]) : 'no HC_Visit'; break;
+          case 'netDump':      value = HC_Net ? HC_Net.dump(args[0] || {}) : 'no HC_Net'; break;
+          case 'netClear':     HC_Net && HC_Net.clearRing(); value = { cleared: true }; break;
+          case 'dbgPing':      value = window.HC_DbgClick ? await window.HC_DbgClick.probe() : 'no HC_DbgClick'; break;
+          case 'dbgTargets':   value = window.HC_DbgClick ? await window.HC_DbgClick.listTargets() : 'no HC_DbgClick'; break;
+          case 'dbgClick': {
+            if (!window.HC_DbgClick) { value = { err: 'no HC_DbgClick' }; break; }
+            const c = HC_Capture.canvas;
+            const r = c.getBoundingClientRect();
+            const sx = c.width / r.width, sy = c.height / r.height;
+            const vx = r.left + args[0] / sx;
+            const vy = r.top  + args[1] / sy;
+            value = await window.HC_DbgClick.click(vx, vy);
+            break;
+          }
           case 'visitSweep':   value = HC_Visit ? await HC_Visit.sweepOnce() : 'no HC_Visit'; break;
-          case 'visitSetNextOk': HC_Visit.setNextOkBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
+          case 'visitSetNext':    HC_Visit.setNextBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
           case 'visitSetTravels': HC_Visit.setTravelsBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
+          case 'visitSetSessionEndOk': HC_Visit.setSessionEndOkBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
           case 'clickAt': {
             // Dispatch a click on the canvas at (x, y) in canvas coords.
             const c = HC_Capture.canvas;

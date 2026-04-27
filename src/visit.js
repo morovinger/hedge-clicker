@@ -18,31 +18,51 @@ window.HC_Visit = (function() {
 
   // Static UI button coords (canvas-relative, 1000×700).
   const BTN = {
-    home:     { x: 80,  y: 660 }, // "Домой" — bottom-left, returns from friend farm
+    home:     { x: 80,  y: 660 }, // "Выйти" — bottom-left, returns from friend farm
+    next:     { x: 0,   y: 0   }, // "Далее" — bottom (right of home), advances to next friend farm. SET via setNextBtn
     voyage:   { x: 765, y: 260 }, // "В путь!" on TRAVELS_HUB
     travels:  { x: 0,   y: 0   }, // "Путешествия" on main farm — TBD
-    nextOk:   { x: 0,   y: 0   }, // confirm button on "next farm" popup — TBD
+    sessionEndOk: { x: 0, y: 0 }, // confirm on "backpack full" dialog — TBD
   };
 
-  // Coarse grid covering the playable area, skipping top/bottom UI bands.
-  // 9 cols × 5 rows = 45 cells; ~120 px spacing covers most resource sprites.
-  const GRID_X = [125, 235, 345, 455, 565, 675, 785, 850, 925];
-  const GRID_Y = [180, 285, 390, 495, 595];
+  // Dense grid covering the playable area, skipping top/bottom UI bands.
+  // 14 cols × 9 rows = 126 cells; ~70px spacing — small enough to hit
+  // most resource sprites which appear ~50-90px wide.
+  const GRID_X = [];
+  const GRID_Y = [];
+  for (let x = 80; x <= 940; x += 70) GRID_X.push(x);  // 14 cols
+  for (let y = 130; y <= 620; y += 70) GRID_Y.push(y); // 9 rows
 
   const VCFG = {
-    clickWait:        700,   // ms to await /proto.html response after a click
-    repeatGap:        450,   // ms between repeat clicks on a confirmed cell
-    maxRepeats:       5,     // tap a confirmed cell up to N times
-    interCellGap:     200,   // ms between distinct cells
-    homeWait:         2500,  // ms after clicking home (popup may appear)
-    maxEmptyPasses:   2,     // give up after this many sweeps with zero hits
+    clickGap:         300,   // ms between blind clicks during a sweep (no per-cell await)
+    settleAfterSweep: 1800,  // ms to wait after sweep for last responses to arrive
+    advanceWait:      2500,  // ms after clicking "Далее"/"Выйти" for next farm to load
+    maxSweepsPerFarm: 4,     // bound how many full passes we do per farm
+    // Threshold: net.totalOk delta from one sweep that counts as "real
+    // collection". Below this, we treat the sweep as failed (probably just
+    // background polls) and advance to the next farm. Tuned for ~38s sweep
+    // time during which the game emits maybe 1-2 unrelated polls.
+    minOkPerSweep:    3,
   };
 
   let running = false;
-  let stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null };
+  let stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null, hitCoords: [] };
 
   function click(cx, cy) {
+    // Prefer chrome.debugger backend (trusted events). Falls back to
+    // synthetic dispatch only if the extension bridge isn't installed
+    // — synthetic clicks are silently dropped by PIXI on this game.
     const rect = canvas.getBoundingClientRect();
+    if (window.HC_DbgClick) {
+      // Canvas sits at iframe origin and is 1:1 with viewport (verified:
+      // rectL=0, rectT=0, rectW=canvas.width). If that ever changes,
+      // translate here.
+      const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
+      const vx = rect.left + cx / sx;
+      const vy = rect.top + cy / sy;
+      window.HC_DbgClick.click(vx, vy);
+      return;
+    }
     const sx = canvas.width / rect.width, sy = canvas.height / rect.height;
     const o = {
       clientX: rect.left + cx / sx, clientY: rect.top + cy / sy,
@@ -58,57 +78,47 @@ window.HC_Visit = (function() {
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Returns 'ok' | 'err' | 'none' — see HC_Net.awaitNextResponse.
-  async function probe(x, y) {
-    stats.attempts++;
-    click(x, y);
-    return await net.awaitNextResponse(VCFG.clickWait);
-  }
-
-  async function farmPass() {
-    let hits = 0;
+  // Blind sweep: fire all 126 cells with `clickGap` between each. No per-cell
+  // oracle wait — instead we measure net.totalOk delta after the sweep
+  // settles. The raw clicks themselves are reliable; only our per-cell
+  // timing window was flaky.
+  // forStop: honor running flag for early termination (true for loop,
+  // false for one-off sweepOnce).
+  async function farmPass(forStop) {
+    const okBefore = net.getStats().totalOk;
     for (const y of GRID_Y) {
       for (const x of GRID_X) {
-        if (!running) return hits;
-        const r = await probe(x, y);
-        if (r === 'ok') {
-          hits++; stats.hits++; stats.lastResult = 'ok@' + x + ',' + y;
-          // Multi-click the same spot — a tree usually needs 3-5 hits
-          for (let i = 0; i < VCFG.maxRepeats - 1; i++) {
-            if (!running) return hits;
-            await sleep(VCFG.repeatGap);
-            const r2 = await probe(x, y);
-            if (r2 !== 'ok') break;
-            hits++; stats.hits++;
-          }
-        }
-        await sleep(VCFG.interCellGap);
+        if (forStop && !running) break;
+        click(x, y);
+        stats.attempts++;
+        await sleep(VCFG.clickGap);
       }
+      if (forStop && !running) break;
     }
-    return hits;
+    // Let final responses arrive
+    await sleep(VCFG.settleAfterSweep);
+    const okAfter = net.getStats().totalOk;
+    const gained = okAfter - okBefore;
+    stats.hits += gained;
+    stats.lastResult = 'sweep+' + gained;
+    return gained;
   }
 
   async function loop() {
-    let emptyPasses = 0;
+    let sweepsThisFarm = 0;
     while (running) {
-      const hits = await farmPass();
+      const gained = await farmPass(true);
       stats.passes++;
-      if (hits === 0) {
-        emptyPasses++;
-        if (emptyPasses >= VCFG.maxEmptyPasses) {
-          console.log('[HC_Visit] No hits for', VCFG.maxEmptyPasses, 'passes — trying home button');
-          click(BTN.home.x, BTN.home.y);
-          stats.farms++;
-          await sleep(VCFG.homeWait);
-          // Auto-confirm popup if coords set
-          if (BTN.nextOk.x || BTN.nextOk.y) {
-            click(BTN.nextOk.x, BTN.nextOk.y);
-            await sleep(VCFG.homeWait);
-          }
-          emptyPasses = 0;
-        }
-      } else {
-        emptyPasses = 0;
+      sweepsThisFarm++;
+      console.log('[HC_Visit] Sweep', sweepsThisFarm, '→ net oks gained:', gained);
+      // Advance if: didn't collect enough OR hit per-farm cap
+      if (gained < VCFG.minOkPerSweep || sweepsThisFarm >= VCFG.maxSweepsPerFarm) {
+        console.log('[HC_Visit] Advancing farm — total sweeps:', sweepsThisFarm);
+        const target = (BTN.next.x || BTN.next.y) ? BTN.next : BTN.home;
+        click(target.x, target.y);
+        stats.farms++;
+        await sleep(VCFG.advanceWait);
+        sweepsThisFarm = 0;
       }
     }
   }
@@ -117,7 +127,7 @@ window.HC_Visit = (function() {
     if (running) return;
     if (!net) { console.error('[HC_Visit] HC_Net missing — cannot start'); return; }
     running = true;
-    stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null };
+    stats = { passes: 0, hits: 0, attempts: 0, farms: 0, lastResult: null, hitCoords: [] };
     console.log('[HC_Visit] START — assumes you are inside a friend farm');
     loop();
   }
@@ -133,12 +143,12 @@ window.HC_Visit = (function() {
     isRunning() { return running; },
     getStats() { return Object.assign({ running }, stats); },
     getButtons() { return BTN; },
-    setHomeBtn(x, y)    { BTN.home.x = x; BTN.home.y = y; },
-    setVoyageBtn(x, y)  { BTN.voyage.x = x; BTN.voyage.y = y; },
-    setNextOkBtn(x, y)  { BTN.nextOk.x = x; BTN.nextOk.y = y; },
-    setTravelsBtn(x, y) { BTN.travels.x = x; BTN.travels.y = y; },
-    // Manual one-shot helpers for calibration/testing
-    probeCell: probe,
+    setHomeBtn(x, y)         { BTN.home.x = x; BTN.home.y = y; },
+    setNextBtn(x, y)         { BTN.next.x = x; BTN.next.y = y; },
+    setVoyageBtn(x, y)       { BTN.voyage.x = x; BTN.voyage.y = y; },
+    setTravelsBtn(x, y)      { BTN.travels.x = x; BTN.travels.y = y; },
+    setSessionEndOkBtn(x, y) { BTN.sessionEndOk.x = x; BTN.sessionEndOk.y = y; },
+    // Manual one-shot helper for calibration/testing
     sweepOnce: farmPass,
   };
 })();
