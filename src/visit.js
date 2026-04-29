@@ -43,6 +43,17 @@ window.HC_Visit = (function() {
     // background polls) and advance to the next farm. Tuned for ~38s sweep
     // time during which the game emits maybe 1-2 unrelated polls.
     minOkPerSweep:    3,
+    // 'auto' = use parsed list when HC_Net has decoded objects AND the
+    // projected coords land inside the canvas; else fall back to grid.
+    // 'parsed' = require parsed list (skip farm if missing).
+    // 'grid' = always grid (legacy behavior).
+    sweepMode:        'auto',
+    parsedClickGap:   220,   // tighter than grid because we have far fewer clicks
+    // Inset around canvas edges to skip projected coords that land in UI
+    // bands (top/bottom HUD, side rails).
+    edgeInsetX:       40,
+    edgeInsetTop:     120,
+    edgeInsetBottom:  80,
   };
 
   let running = false;
@@ -104,10 +115,60 @@ window.HC_Visit = (function() {
     return gained;
   }
 
+  // Project parsed world objects to in-canvas screen coords using HC_Overlay's
+  // current transform. Filters out points outside the canvas / UI bands.
+  function projectedClickList(opts) {
+    if (!net || !window.HC_Overlay) return null;
+    const r = net.lastFarmObjects(opts || {});
+    if (!r.found || !r.objects || r.objects.length === 0) return null;
+    const W = canvas.width, H = canvas.height;
+    const xLo = VCFG.edgeInsetX, xHi = W - VCFG.edgeInsetX;
+    const yLo = VCFG.edgeInsetTop, yHi = H - VCFG.edgeInsetBottom;
+    const out = [];
+    for (const o of r.objects) {
+      const p = window.HC_Overlay.toScreen(o.x, o.y);
+      if (p.x < xLo || p.x > xHi || p.y < yLo || p.y > yHi) continue;
+      out.push({ type: o.type, wx: o.x, wy: o.y, sx: Math.round(p.x), sy: Math.round(p.y), eid: o.eid });
+    }
+    return out;
+  }
+
+  // Parsed sweep: click each projected collectible position once.
+  async function parsedPass(forStop) {
+    const list = projectedClickList();
+    if (!list || list.length === 0) return null; // signal to caller to fall back
+    const okBefore = net.getStats().totalOk;
+    for (const c of list) {
+      if (forStop && !running) break;
+      click(c.sx, c.sy);
+      stats.attempts++;
+      stats.hitCoords.push([c.sx, c.sy, c.type]);
+      await sleep(VCFG.parsedClickGap);
+    }
+    await sleep(VCFG.settleAfterSweep);
+    const gained = net.getStats().totalOk - okBefore;
+    stats.hits += gained;
+    stats.lastResult = 'parsed' + list.length + '+' + gained;
+    return gained;
+  }
+
+  async function runSweep(forStop) {
+    if (VCFG.sweepMode === 'grid') return farmPass(forStop);
+    if (VCFG.sweepMode === 'parsed') {
+      const g = await parsedPass(forStop);
+      return g == null ? 0 : g;
+    }
+    // auto: prefer parsed, fall back to grid
+    const g = await parsedPass(forStop);
+    if (g != null) return g;
+    console.log('[HC_Visit] No parsed objects/transform — falling back to grid sweep');
+    return farmPass(forStop);
+  }
+
   async function loop() {
     let sweepsThisFarm = 0;
     while (running) {
-      const gained = await farmPass(true);
+      const gained = await runSweep(true);
       stats.passes++;
       sweepsThisFarm++;
       console.log('[HC_Visit] Sweep', sweepsThisFarm, '→ net oks gained:', gained);
@@ -150,6 +211,12 @@ window.HC_Visit = (function() {
     setSessionEndOkBtn(x, y) { BTN.sessionEndOk.x = x; BTN.sessionEndOk.y = y; },
     // Manual one-shot helper for calibration/testing
     sweepOnce: farmPass,
+    parsedSweepOnce: parsedPass,
+    projectedClickList,
+    setSweepMode(m) { if (m === 'auto' || m === 'parsed' || m === 'grid') VCFG.sweepMode = m; return VCFG.sweepMode; },
+    getSweepMode() { return VCFG.sweepMode; },
+    getCfg() { return Object.assign({}, VCFG); },
+    setCfg(p) { Object.assign(VCFG, p || {}); return Object.assign({}, VCFG); },
   };
 })();
 }

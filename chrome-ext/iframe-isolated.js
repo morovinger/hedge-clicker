@@ -31,3 +31,33 @@ window.addEventListener('message', function (ev) {
 });
 
 console.log('[HC-Iso] debugger bridge ready');
+
+// ── Capture our own URL when it's the "proper" vkjs/ form ──
+// Two URL families exist on valley.redspell.ru:
+//   /play/vkjs/index.html?... — proper, no VK widgets, our target
+//   /play/vk/index.html?...   — VK-iframe form, has widgets that interfere
+// Only the vkjs/ form gets persisted; the toolbar action then re-uses it
+// directly without going through the VK launcher.
+(function captureSelfUrl() {
+  try {
+    const url = location.href;
+    const isVkjs = /\/play\/vkjs\//.test(url);
+    const isVk   = /\/play\/vk\//.test(url);
+    if (!isVkjs && !isVk) return;
+    // Need the auth params to be useful for re-launch
+    if (!/[?&]viewer_id=/.test(url) || !/[?&]sid=/.test(url)) return;
+    // Don't overwrite a good URL with a bad one
+    if (isVk) {
+      console.log('[HC-Iso] on /play/vk/ form — ignoring (VK widgets interfere). Use /play/vkjs/.');
+      return;
+    }
+    // Check expire if present
+    const m = /[?&]expire=(\d+)/.exec(url);
+    if (m && parseInt(m[1], 10) * 1000 < Date.now()) return;
+    chrome.storage.local.set({
+      lastGameUrl: { url, capturedAt: Date.now(), pageUrl: url, source: 'self' }
+    }, function () {
+      console.log('[HC-Iso] captured live vkjs URL → chrome.storage.local.lastGameUrl');
+    });
+  } catch (e) { /* ignore */ }
+})();

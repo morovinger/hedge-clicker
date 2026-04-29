@@ -1,5 +1,5 @@
 // Hedgehog Smart Collector (Ёжики) - Vision-based Auto-Clicker
-// Built: 2026-04-27
+// Built: 2026-04-29
 //
 // HOW TO USE:
 // 1. Open the game at https://vk.com/ezhiky_game
@@ -374,7 +374,7 @@
     console.log('[HC] Net already installed — reusing.');
   } else {
   window.HC_Net = (function() {
-    let totalOk = 0, totalErr = 0, totalSeen = 0;
+    let totalOk = 0, totalErr = 0, totalSeen = 0, totalTick = 0, total200 = 0;
     let lastOkAt = 0, lastErrAt = 0, lastResponseAt = 0;
   
     // Ring buffer of recent (request, response) pairs for offline decoding.
@@ -423,26 +423,31 @@
           this.addEventListener('load', () => {
             totalSeen++;
             lastResponseAt = Date.now();
-            let ok = false;
+            let ok = false, tick = false, http200 = false;
+            let envelope = null;
             let respBytes = null;
+            try { http200 = this.status === 200; } catch (e) {}
             try {
               if (this.response instanceof ArrayBuffer) {
                 respBytes = Array.from(new Uint8Array(this.response));
-                // 0x50 0x00 ('P\0') is the click-acknowledged envelope
-                // (action produced game state change). 0x30 0x00 ('0\0')
-                // is the background-tick envelope (no action). We want
-                // only the former as the success oracle.
-                if (respBytes.length >= 2 && respBytes[0] === 0x50 && respBytes[1] === 0x00) {
-                  ok = true;
+                // Envelope discrimination: 0x50 0x00 ('P\0') = click-acknowledged
+                // (action produced state change — friend-farm collects). 0x30 0x00
+                // ('0\0') = background tick (no action). Both are HTTP 200.
+                if (respBytes.length >= 2 && respBytes[1] === 0x00) {
+                  if (respBytes[0] === 0x50)      { ok = true;   envelope = 'P'; }
+                  else if (respBytes[0] === 0x30) { tick = true; envelope = '0'; }
+                  else                            { envelope = String.fromCharCode(respBytes[0]); }
                 }
               }
             } catch (e) {}
-            if (ok) { totalOk++; lastOkAt = lastResponseAt; }
-            else    { totalErr++; lastErrAt = lastResponseAt; }
+            if (http200) total200++;
+            if (ok)        { totalOk++;   lastOkAt  = lastResponseAt; }
+            else if (tick) { totalTick++; }
+            else           { totalErr++;  lastErrAt = lastResponseAt; }
             pushRing({
               url: reqUrl,
               reqAt, respAt: lastResponseAt,
-              ok,
+              ok, tick, http200, envelope,
               reqLen: reqBytes ? reqBytes.length : 0,
               respLen: respBytes ? respBytes.length : 0,
               req: reqBytes,
@@ -494,13 +499,117 @@
   
     function clearRing() { ring.length = 0; }
   
+    // ── Farm-load packet parser ──
+    // Per doc 06: each object record is laid out as
+    //   [int32 z=-13][int32 ?][uint16 N][N ASCII type][0x00][0x06 0x01]
+    //   [4 entity_id][4 fingerprint=0x41DA7BCA][0x00][world_x][world_y][?][?]
+    // Total stride = 26 + N bytes. The trailing 4-byte field reads cleanly as
+    // (uint8 x, uint8 y) in world tile coords (X 6–250, Y 0–~100).
+    //
+    // Strategy: scan for length-prefixed printable strings whose surrounding
+    // bytes match the flag/fingerprint pattern. Robust against header drift,
+    // intermediate stray bytes, and variant record types we haven't seen.
+    const FINGERPRINT = [0xCA, 0x7B, 0xDA, 0x41]; // little-endian 0x41DA7BCA
+    const TYPE_RE = /^[a-z]{2,3}_[a-z][a-z0-9_]+$/;
+  
+    function parseFarmLoad(bytes) {
+      if (!bytes || bytes.length < 64) return [];
+      const out = [];
+      const seenIds = new Set();
+      // Records start with a uint16 length prefix at offset 8 in the record;
+      // we scan the buffer for that prefix + ASCII string + flag bytes.
+      const N = bytes.length;
+      for (let i = 8; i < N - 30; i++) {
+        const len = bytes[i] | (bytes[i + 1] << 8);
+        if (len < 4 || len > 32) continue;
+        const strStart = i + 2;
+        const strEnd = strStart + len;
+        if (strEnd + 16 > N) continue;
+  
+        // Cheap structural check before reading the string: flag bytes must
+        // match. This filters out the vast majority of false positives.
+        if (bytes[strEnd] !== 0x00) continue;
+        if (bytes[strEnd + 1] !== 0x06 || bytes[strEnd + 2] !== 0x01) continue;
+        // Fingerprint at strEnd + 7..10
+        if (bytes[strEnd + 7]  !== FINGERPRINT[0]) continue;
+        if (bytes[strEnd + 8]  !== FINGERPRINT[1]) continue;
+        if (bytes[strEnd + 9]  !== FINGERPRINT[2]) continue;
+        if (bytes[strEnd + 10] !== FINGERPRINT[3]) continue;
+  
+        // Now check ASCII string
+        let ok = true, s = '';
+        for (let j = 0; j < len; j++) {
+          const c = bytes[strStart + j];
+          if (c < 0x20 || c > 0x7e) { ok = false; break; }
+          s += String.fromCharCode(c);
+        }
+        if (!ok || !TYPE_RE.test(s)) continue;
+  
+        // Entity id at strEnd + 3..6 (4 bytes — treat as opaque tuple)
+        const idBytes = (bytes[strEnd + 3] << 24) | (bytes[strEnd + 4] << 16) |
+                        (bytes[strEnd + 5] << 8)  |  bytes[strEnd + 6];
+        const eid = idBytes >>> 0;
+        if (seenIds.has(eid)) { i = strEnd + 15; continue; }
+        seenIds.add(eid);
+  
+        // Position bytes at strEnd + 12 (x), strEnd + 13 (y)
+        const wx = bytes[strEnd + 12];
+        const wy = bytes[strEnd + 13];
+        const wx2 = bytes[strEnd + 14]; // high byte of x for big maps (usually 0)
+        const wy2 = bytes[strEnd + 15];
+  
+        out.push({ type: s, x: wx | (wx2 << 8), y: wy | (wy2 << 8), eid, off: i });
+        i = strEnd + 15; // skip past this record
+      }
+      return out;
+    }
+  
+    // Collectible type prefixes (per doc 06). tl_/dc_/ga_ are decoration.
+    const COLLECTIBLE_PREFIXES = ['te_', 'sb_', 'pl_', 'pi_', 'fl_'];
+    function isCollectible(type, prefixes) {
+      const p = prefixes || COLLECTIBLE_PREFIXES;
+      for (let i = 0; i < p.length; i++) if (type.indexOf(p[i]) === 0) return true;
+      return false;
+    }
+  
+    // Find the most recent large /proto.html response (the farm-load) and
+    // parse it. Returns { found, count, objects, source: {seq, respLen} }.
+    // opts: { collectiblesOnly: bool, prefixes: string[], minRespLen: number }
+    function lastFarmObjects(opts) {
+      opts = opts || {};
+      const minLen = opts.minRespLen || 8000; // farm-load is ~67KB; tick polls ~3KB
+      let pick = null;
+      for (let i = ring.length - 1; i >= 0; i--) {
+        const e = ring[i];
+        if (!e.ok) continue;
+        if (e.respLen < minLen) continue;
+        if (!e.resp) continue;
+        pick = e; break;
+      }
+      if (!pick) return { found: false, count: 0, objects: [], source: null };
+      const all = parseFarmLoad(pick.resp);
+      const filtered = (opts.collectiblesOnly === false)
+        ? all
+        : all.filter(o => isCollectible(o.type, opts.prefixes));
+      return {
+        found: true,
+        count: filtered.length,
+        totalRecords: all.length,
+        objects: filtered,
+        source: { seq: pick.seq, respLen: pick.respLen, respAt: pick.respAt },
+      };
+    }
+  
     return {
       awaitNextResponse,
       getStats() {
-        return { totalSeen, totalOk, totalErr, lastOkAt, lastErrAt, lastResponseAt, ringLen: ring.length };
+        return { totalSeen, totalOk, totalErr, totalTick, total200, lastOkAt, lastErrAt, lastResponseAt, ringLen: ring.length };
       },
       dump,
       clearRing,
+      parseFarmLoad,
+      lastFarmObjects,
+      isCollectible,
       // Cheap "did anything succeed in the last N ms?" — useful for a passive
       // sanity check after a known game action.
       wasRecentSuccess(sinceMs) { return Date.now() - lastOkAt < sinceMs; },
@@ -1080,6 +1189,202 @@
   })();
   
 
+  // ═══ overlay.js ═══
+  // ── HC_Overlay: canvas overlay for visualizing parsed farm objects ──
+  // Draws colored dots at projected screen coords using an isometric transform
+  // from world tile coords. Used to calibrate the world→screen mapping by
+  // eyeballing whether dots land on visible resources.
+  //
+  // Iso projection (standard 2:1):
+  //   screen_x = (wx - wy) * tw/2 + cx
+  //   screen_y = (wx + wy) * th/2 + cy
+  //
+  // (cx, cy) is the screen position of world (0,0). Without camera/scroll info
+  // this is set manually by the user. Once aligned, HC_Visit can use the same
+  // transform to click each parsed object.
+  
+  if (window.HC_Overlay) {
+    console.log('[HC] Overlay already installed — reusing.');
+  } else {
+  window.HC_Overlay = (function() {
+    const cap = window.HC_Capture;
+    const net = window.HC_Net;
+  
+    // Default transform — guesses, will be tuned via UI / calibration.
+    const T = { tw: 32, th: 16, cx: 500, cy: 350 };
+  
+    let overlay = null, ctx2d = null, visible = false;
+    let lastObjects = [];
+    let dotRadius = 4;
+  
+    // Color per type prefix
+    const COLORS = {
+      te_: '#ff4d4d', // trees — red
+      sb_: '#ffd84d', // seedbeds — gold
+      pl_: '#4dff66', // plants — green
+      pi_: '#a04dff', // ?
+      fl_: '#ff9aff', // flowers
+    };
+    function colorFor(type) {
+      for (const k of Object.keys(COLORS)) if (type.indexOf(k) === 0) return COLORS[k];
+      return '#888';
+    }
+  
+    function ensureOverlay() {
+      const game = cap && cap.canvas;
+      if (!game) return null;
+      if (overlay && overlay.isConnected) return overlay;
+      overlay = document.createElement('canvas');
+      overlay.id = 'hc-overlay';
+      overlay.style.position = 'absolute';
+      overlay.style.pointerEvents = 'none';
+      overlay.style.zIndex = '99998';
+      overlay.style.left = '0px';
+      overlay.style.top = '0px';
+      document.body.appendChild(overlay);
+      ctx2d = overlay.getContext('2d');
+      syncRect();
+      return overlay;
+    }
+  
+    function syncRect() {
+      if (!overlay) return;
+      const game = cap.canvas;
+      const r = game.getBoundingClientRect();
+      overlay.style.left = (window.scrollX + r.left) + 'px';
+      overlay.style.top  = (window.scrollY + r.top)  + 'px';
+      overlay.style.width  = r.width  + 'px';
+      overlay.style.height = r.height + 'px';
+      // Internal resolution = game canvas resolution so toScreen() math is in
+      // canvas pixels, matching HC_Visit/HC_DbgClick coordinate space.
+      overlay.width  = game.width;
+      overlay.height = game.height;
+    }
+  
+    function toScreen(wx, wy) {
+      return {
+        x: (wx - wy) * (T.tw / 2) + T.cx,
+        y: (wx + wy) * (T.th / 2) + T.cy,
+      };
+    }
+  
+    function redraw() {
+      if (!overlay || !ctx2d) return;
+      syncRect();
+      ctx2d.clearRect(0, 0, overlay.width, overlay.height);
+      if (!visible) return;
+  
+      // Faint grid for orientation: world (0..maxX) × (0..maxY) lines every 10 tiles
+      ctx2d.lineWidth = 1;
+      ctx2d.strokeStyle = 'rgba(255,255,255,0.10)';
+      let xMax = 0, yMax = 0;
+      for (const o of lastObjects) { if (o.x > xMax) xMax = o.x; if (o.y > yMax) yMax = o.y; }
+      xMax = Math.max(xMax, 50); yMax = Math.max(yMax, 30);
+      for (let g = 0; g <= xMax + 5; g += 10) {
+        const a = toScreen(g, 0), b = toScreen(g, yMax);
+        ctx2d.beginPath(); ctx2d.moveTo(a.x, a.y); ctx2d.lineTo(b.x, b.y); ctx2d.stroke();
+      }
+      for (let g = 0; g <= yMax + 5; g += 10) {
+        const a = toScreen(0, g), b = toScreen(xMax, g);
+        ctx2d.beginPath(); ctx2d.moveTo(a.x, a.y); ctx2d.lineTo(b.x, b.y); ctx2d.stroke();
+      }
+  
+      // Origin marker
+      const origin = toScreen(0, 0);
+      ctx2d.fillStyle = '#fff';
+      ctx2d.beginPath(); ctx2d.arc(origin.x, origin.y, 3, 0, 6.283); ctx2d.fill();
+  
+      // Object dots
+      for (const o of lastObjects) {
+        const p = toScreen(o.x, o.y);
+        ctx2d.fillStyle = colorFor(o.type);
+        ctx2d.beginPath();
+        ctx2d.arc(p.x, p.y, dotRadius, 0, 6.283);
+        ctx2d.fill();
+      }
+    }
+  
+    function loadObjects(opts) {
+      if (!net) { console.warn('[HC_Overlay] HC_Net missing'); return 0; }
+      const r = net.lastFarmObjects(opts || {});
+      lastObjects = r.objects || [];
+      return lastObjects.length;
+    }
+  
+    let resizeObs = null;
+    function attachWatchers() {
+      if (resizeObs) return;
+      if (typeof ResizeObserver === 'function' && cap.canvas) {
+        resizeObs = new ResizeObserver(redraw);
+        resizeObs.observe(cap.canvas);
+      }
+      window.addEventListener('scroll', redraw, true);
+      window.addEventListener('resize', redraw);
+    }
+  
+    function show(opts) {
+      ensureOverlay();
+      attachWatchers();
+      visible = true;
+      if (opts && (opts.tw || opts.th || opts.cx != null || opts.cy != null)) setTransform(opts);
+      if (loadObjects(opts) === 0 && opts && opts.objects) lastObjects = opts.objects;
+      redraw();
+      return { count: lastObjects.length, transform: { ...T } };
+    }
+  
+    function hide() {
+      visible = false;
+      if (overlay && ctx2d) ctx2d.clearRect(0, 0, overlay.width, overlay.height);
+      return { hidden: true };
+    }
+  
+    function setTransform(t) {
+      if (!t) return T;
+      if (typeof t.tw === 'number') T.tw = t.tw;
+      if (typeof t.th === 'number') T.th = t.th;
+      if (typeof t.cx === 'number') T.cx = t.cx;
+      if (typeof t.cy === 'number') T.cy = t.cy;
+      redraw();
+      return { ...T };
+    }
+  
+    function getTransform() { return { ...T }; }
+  
+    // Solve transform from two known world↔screen pairs. Caller picks two
+    // visible objects on screen (one near origin, one far) and supplies their
+    // world coords + the screen pixels they actually appear at.
+    // Each pair: { wx, wy, sx, sy }.
+    function calibrateFromPairs(p1, p2) {
+      // System:  sx = (wx-wy)*a + cx     where a = tw/2
+      //          sy = (wx+wy)*b + cy     where b = th/2
+      const u1 = p1.wx - p1.wy, v1 = p1.wx + p1.wy;
+      const u2 = p2.wx - p2.wy, v2 = p2.wx + p2.wy;
+      if (u1 === u2 || v1 === v2) {
+        console.warn('[HC_Overlay] degenerate calibration pairs (same diag)');
+        return null;
+      }
+      const a = (p1.sx - p2.sx) / (u1 - u2);
+      const cx = p1.sx - u1 * a;
+      const b = (p1.sy - p2.sy) / (v1 - v2);
+      const cy = p1.sy - v1 * b;
+      T.tw = a * 2; T.th = b * 2; T.cx = cx; T.cy = cy;
+      redraw();
+      return { ...T };
+    }
+  
+    return {
+      show, hide, redraw,
+      setTransform, getTransform,
+      toScreen,
+      calibrateFromPairs,
+      loadObjects,
+      getObjects() { return lastObjects.slice(); },
+      isVisible() { return visible; },
+    };
+  })();
+  }
+  
+
   // ═══ visit.js ═══
   // ── HC_Visit: hybrid auto-collect on friend farms ──
   // Drives the game by dispatching synthetic pointer events on the canvas
@@ -1126,6 +1431,17 @@
       // background polls) and advance to the next farm. Tuned for ~38s sweep
       // time during which the game emits maybe 1-2 unrelated polls.
       minOkPerSweep:    3,
+      // 'auto' = use parsed list when HC_Net has decoded objects AND the
+      // projected coords land inside the canvas; else fall back to grid.
+      // 'parsed' = require parsed list (skip farm if missing).
+      // 'grid' = always grid (legacy behavior).
+      sweepMode:        'auto',
+      parsedClickGap:   220,   // tighter than grid because we have far fewer clicks
+      // Inset around canvas edges to skip projected coords that land in UI
+      // bands (top/bottom HUD, side rails).
+      edgeInsetX:       40,
+      edgeInsetTop:     120,
+      edgeInsetBottom:  80,
     };
   
     let running = false;
@@ -1187,10 +1503,60 @@
       return gained;
     }
   
+    // Project parsed world objects to in-canvas screen coords using HC_Overlay's
+    // current transform. Filters out points outside the canvas / UI bands.
+    function projectedClickList(opts) {
+      if (!net || !window.HC_Overlay) return null;
+      const r = net.lastFarmObjects(opts || {});
+      if (!r.found || !r.objects || r.objects.length === 0) return null;
+      const W = canvas.width, H = canvas.height;
+      const xLo = VCFG.edgeInsetX, xHi = W - VCFG.edgeInsetX;
+      const yLo = VCFG.edgeInsetTop, yHi = H - VCFG.edgeInsetBottom;
+      const out = [];
+      for (const o of r.objects) {
+        const p = window.HC_Overlay.toScreen(o.x, o.y);
+        if (p.x < xLo || p.x > xHi || p.y < yLo || p.y > yHi) continue;
+        out.push({ type: o.type, wx: o.x, wy: o.y, sx: Math.round(p.x), sy: Math.round(p.y), eid: o.eid });
+      }
+      return out;
+    }
+  
+    // Parsed sweep: click each projected collectible position once.
+    async function parsedPass(forStop) {
+      const list = projectedClickList();
+      if (!list || list.length === 0) return null; // signal to caller to fall back
+      const okBefore = net.getStats().totalOk;
+      for (const c of list) {
+        if (forStop && !running) break;
+        click(c.sx, c.sy);
+        stats.attempts++;
+        stats.hitCoords.push([c.sx, c.sy, c.type]);
+        await sleep(VCFG.parsedClickGap);
+      }
+      await sleep(VCFG.settleAfterSweep);
+      const gained = net.getStats().totalOk - okBefore;
+      stats.hits += gained;
+      stats.lastResult = 'parsed' + list.length + '+' + gained;
+      return gained;
+    }
+  
+    async function runSweep(forStop) {
+      if (VCFG.sweepMode === 'grid') return farmPass(forStop);
+      if (VCFG.sweepMode === 'parsed') {
+        const g = await parsedPass(forStop);
+        return g == null ? 0 : g;
+      }
+      // auto: prefer parsed, fall back to grid
+      const g = await parsedPass(forStop);
+      if (g != null) return g;
+      console.log('[HC_Visit] No parsed objects/transform — falling back to grid sweep');
+      return farmPass(forStop);
+    }
+  
     async function loop() {
       let sweepsThisFarm = 0;
       while (running) {
-        const gained = await farmPass(true);
+        const gained = await runSweep(true);
         stats.passes++;
         sweepsThisFarm++;
         console.log('[HC_Visit] Sweep', sweepsThisFarm, '→ net oks gained:', gained);
@@ -1233,6 +1599,12 @@
       setSessionEndOkBtn(x, y) { BTN.sessionEndOk.x = x; BTN.sessionEndOk.y = y; },
       // Manual one-shot helper for calibration/testing
       sweepOnce: farmPass,
+      parsedSweepOnce: parsedPass,
+      projectedClickList,
+      setSweepMode(m) { if (m === 'auto' || m === 'parsed' || m === 'grid') VCFG.sweepMode = m; return VCFG.sweepMode; },
+      getSweepMode() { return VCFG.sweepMode; },
+      getCfg() { return Object.assign({}, VCFG); },
+      setCfg(p) { Object.assign(VCFG, p || {}); return Object.assign({}, VCFG); },
     };
   })();
   }

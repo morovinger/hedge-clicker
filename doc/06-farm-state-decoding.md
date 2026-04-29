@@ -289,3 +289,67 @@ on screen, then back-solve the transform from `(packed_value) →
    on the canvas. Iterate K until dots align.
 4. Once aligned, expose `HC_Net.lastFarmObjects()` returning
    `[{type, x, y}, ...]` filtered to collectibles.
+
+## Implementation status (this session)
+
+Code shipped:
+
+- `src/network.js` — `parseFarmLoad(bytes)` walks responses, validates each
+  candidate record by the 0x06 0x01 flag pair + 0x41DA7BCA fingerprint
+  before reading the type string. Tolerant to header drift and unknown
+  intermediate bytes. Verified end-to-end against a synthetic record.
+- `src/network.js` — `lastFarmObjects(opts)` picks the most recent
+  `>=8000`-byte ok response from the ring and returns
+  `{found, count, totalRecords, objects:[{type, x, y, eid}], source}`.
+  Defaults to filtering to collectible prefixes (`te_`, `sb_`, `pl_`,
+  `pi_`, `fl_`); pass `{collectiblesOnly:false}` to see everything.
+- `src/network.js` — envelope split: `totalOk` now counts only `0x50 0x00`
+  (interactive collects), `totalTick` counts `0x30 0x00` (background
+  polls), `total200` is HTTP-200 catch-all. The friend-farm sweep oracle
+  is still `totalOk` delta — same semantics as before, just no longer
+  inflated by main-farm tick traffic.
+- `src/overlay.js` — `HC_Overlay` renders parsed object dots over the
+  game canvas using a tunable iso transform
+  `(tw, th, cx, cy)`. Provides `show()`, `hide()`, `setTransform()`,
+  `toScreen(wx, wy)`, and `calibrateFromPairs(p1, p2)` which solves the
+  4-param iso transform from two known world↔screen pairs.
+- `src/visit.js` — new `parsedPass()` clicks each projected collectible
+  position once, plus an `auto` sweep mode that prefers the parsed list
+  and falls back to the 14×9 grid when no objects are decoded or the
+  transform isn't calibrated. Skips projected coords inside UI bands
+  (top 120 px, bottom 80 px, ±40 px side rails).
+
+Bridge surface (in `chrome-ext/iframe-script.js`):
+
+- `netFarmObjects` / `netFarmObjectsRaw` — summary or full parsed list.
+- `overlayShow` / `overlayHide` / `overlaySet` / `overlayGet` /
+  `overlayProject` / `overlayCalibrate` — visualize and tune the
+  transform.
+- `visitParsedSweep` — one-shot parsed sweep (validation harness).
+- `visitProjected` — return the would-be click list (for inspection).
+- `visitSetMode('auto'|'parsed'|'grid')` — switch sweep strategy.
+
+### Next concrete action — live calibration
+
+The parser produces world tile coords (X 6–250, Y 0–~100), but the
+world→screen transform parameters `(tw, th, cx, cy)` are still guesses
+(defaults `tw=32, th=16, cx=500, cy=350`). World coverage exceeds canvas
+extent, so a camera/scroll offset is implicit in `(cx, cy)`.
+
+To calibrate against a live friend farm:
+
+1. Enter a friend farm (parsed list populated automatically by
+   `HC_Net`).
+2. Run `overlayShow {collectiblesOnly:true}` — first-pass dots will
+   land in the wrong place.
+3. Pick two visible objects on screen (e.g. two distinct trees), note
+   their actual canvas pixel positions and look up their world coords
+   from the parsed list (`netFarmObjectsRaw`).
+4. Call `overlayCalibrate {wx, wy, sx, sy} {wx, wy, sx, sy}` — dots
+   should snap to the visible objects.
+5. Run `visitParsedSweep` to validate: expect `totalOk` delta close to
+   the count of ripe collectibles (vs ~3–5 for a blind grid sweep that
+   happened to graze a few).
+6. Persist the calibrated transform per farm or as a default; check
+   whether it's stable across farms (likely yes, since the camera reset
+   is consistent on entry).

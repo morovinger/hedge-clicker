@@ -12,7 +12,7 @@ const PASTE_OUT = path.join(__dirname, 'clicker.js');
 const EXT_OUT = path.join(__dirname, 'chrome-ext', 'iframe-script.js');
 
 // Load order matters: config → capture → vision → clicker → visit → ui
-const modules = ['config.js', 'glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js', 'vision.js', 'clicker.js', 'visit.js', 'ui.js'];
+const modules = ['config.js', 'glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js', 'vision.js', 'clicker.js', 'overlay.js', 'visit.js', 'ui.js'];
 
 function readModules() {
   return modules.map(file => ({
@@ -162,6 +162,42 @@ function buildExtBundle(mods) {
           case 'netAwait':     value = HC_Net ? await HC_Net.awaitNextResponse(args[0] || 800) : 'no HC_Net'; break;
           case 'netDump':      value = HC_Net ? HC_Net.dump(args[0] || {}) : 'no HC_Net'; break;
           case 'netClear':     HC_Net && HC_Net.clearRing(); value = { cleared: true }; break;
+          case 'netFarmObjects': {
+            if (!HC_Net) { value = 'no HC_Net'; break; }
+            const r = HC_Net.lastFarmObjects(args[0] || {});
+            // Without overlay/calibration, just summarize types and bbox
+            const types = {};
+            let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+            for (const o of r.objects) {
+              types[o.type] = (types[o.type] || 0) + 1;
+              if (o.x < xMin) xMin = o.x; if (o.x > xMax) xMax = o.x;
+              if (o.y < yMin) yMin = o.y; if (o.y > yMax) yMax = o.y;
+            }
+            value = {
+              found: r.found, count: r.count, totalRecords: r.totalRecords,
+              source: r.source,
+              types,
+              bbox: r.objects.length ? { xMin, xMax, yMin, yMax } : null,
+              sample: r.objects.slice(0, 12),
+            };
+            break;
+          }
+          case 'netFarmObjectsRaw': {
+            if (!HC_Net) { value = 'no HC_Net'; break; }
+            value = HC_Net.lastFarmObjects(args[0] || {});
+            break;
+          }
+          case 'overlayShow':       value = HC_Overlay ? HC_Overlay.show(args[0] || {}) : 'no HC_Overlay'; break;
+          case 'overlayHide':       value = HC_Overlay ? HC_Overlay.hide() : 'no HC_Overlay'; break;
+          case 'overlaySet':        value = HC_Overlay ? HC_Overlay.setTransform(args[0] || {}) : 'no HC_Overlay'; break;
+          case 'overlayGet':        value = HC_Overlay ? HC_Overlay.getTransform() : 'no HC_Overlay'; break;
+          case 'overlayCalibrate':  value = HC_Overlay ? HC_Overlay.calibrateFromPairs(args[0], args[1]) : 'no HC_Overlay'; break;
+          case 'overlayProject': {
+            // Project a world (wx, wy) to canvas pixel coords using current transform.
+            if (!HC_Overlay) { value = 'no HC_Overlay'; break; }
+            value = HC_Overlay.toScreen(args[0], args[1]);
+            break;
+          }
           case 'dbgPing':      value = window.HC_DbgClick ? await window.HC_DbgClick.probe() : 'no HC_DbgClick'; break;
           case 'dbgTargets':   value = window.HC_DbgClick ? await window.HC_DbgClick.listTargets() : 'no HC_DbgClick'; break;
           case 'dbgClick': {
@@ -174,7 +210,13 @@ function buildExtBundle(mods) {
             value = await window.HC_DbgClick.click(vx, vy);
             break;
           }
-          case 'visitSweep':   value = HC_Visit ? await HC_Visit.sweepOnce() : 'no HC_Visit'; break;
+          case 'visitSweep':       value = HC_Visit ? await HC_Visit.sweepOnce() : 'no HC_Visit'; break;
+          case 'visitParsedSweep': value = HC_Visit ? await HC_Visit.parsedSweepOnce() : 'no HC_Visit'; break;
+          case 'visitProjected':   value = HC_Visit ? HC_Visit.projectedClickList(args[0]) : 'no HC_Visit'; break;
+          case 'visitSetMode':     value = HC_Visit ? HC_Visit.setSweepMode(args[0]) : 'no HC_Visit'; break;
+          case 'visitGetMode':     value = HC_Visit ? HC_Visit.getSweepMode() : 'no HC_Visit'; break;
+          case 'visitGetCfg':      value = HC_Visit ? HC_Visit.getCfg() : 'no HC_Visit'; break;
+          case 'visitSetCfg':      value = HC_Visit ? HC_Visit.setCfg(args[0]) : 'no HC_Visit'; break;
           case 'visitSetNext':    HC_Visit.setNextBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
           case 'visitSetTravels': HC_Visit.setTravelsBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
           case 'visitSetSessionEndOk': HC_Visit.setSessionEndOkBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;

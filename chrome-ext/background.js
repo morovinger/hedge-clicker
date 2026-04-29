@@ -79,3 +79,33 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   console.log('[HC-BG] debugger detached', reason);
   attached = null;
 });
+
+// ── Toolbar action: open game with last captured VK URL ──
+// vk-launcher.js writes `lastGameUrl` to chrome.storage.local whenever the
+// VK app page mounts the game iframe. Clicking the extension toolbar
+// icon opens that URL in a new tab — no copy-pasting tokens needed.
+chrome.action.onClicked.addListener(async () => {
+  try {
+    const { lastGameUrl } = await chrome.storage.local.get('lastGameUrl');
+    if (!lastGameUrl || !lastGameUrl.url) {
+      // No URL captured yet — open the VK launcher so vk-launcher.js can grab one.
+      chrome.tabs.create({ url: 'https://vk.com/ezhiky_game' });
+      console.log('[HC-BG] no stored game URL — opened VK launcher');
+      return;
+    }
+    // Sanity: warn if the captured URL's expire= is in the past.
+    const m = /[?&]expire=(\d+)/.exec(lastGameUrl.url);
+    if (m) {
+      const exp = parseInt(m[1], 10) * 1000;
+      if (exp < Date.now()) {
+        console.log('[HC-BG] stored URL expired — opening VK launcher to refresh');
+        chrome.tabs.create({ url: 'https://vk.com/ezhiky_game' });
+        return;
+      }
+    }
+    chrome.tabs.create({ url: lastGameUrl.url });
+  } catch (e) {
+    console.warn('[HC-BG] action.onClicked failed', e);
+    chrome.tabs.create({ url: 'https://vk.com/ezhiky_game' });
+  }
+});
