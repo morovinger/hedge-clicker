@@ -10,6 +10,7 @@ This folder is the project's design log. Numbered files are written in order; la
 | [04](04-glspy-pixel-diff.md) | GLSpy + pixel-diff click detection | Working primitive — needs calibration |
 | [05](05-network-api-discovery.md) | Game API discovery (binary RPC over `/proto.html`) | Live capture — path to fully headless |
 | [06](06-farm-state-decoding.md) | Decode farm-load XHR for resource positions | Parser shipped — live calibration pending |
+| [07](07-autonomous-visit-loop.md) | Autonomous farm-to-farm Visit loop | Working primitive — popup advance + hub bootstrap need live tuning |
 
 Source code lives in `../src/`. The main project README is `../README.md`.
 
