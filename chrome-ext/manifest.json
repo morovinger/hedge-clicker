@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Hedgehog Vision",
-  "version": "0.3.0",
-  "description": "Auto-injects the vision-based auto-clicker into Ёжики and captures fresh VK launch URLs.",
-  "permissions": ["debugger", "storage"],
+  "version": "0.4.0",
+  "description": "Auto-injects the vision-based auto-clicker into Ёжики on valley.redspell.ru. Toolbar icon opens the game directly.",
+  "permissions": ["debugger"],
   "background": { "service_worker": "background.js" },
   "action": {
-    "default_title": "Open Ёжики (uses last captured VK URL)"
+    "default_title": "Open Ёжики (valley.redspell.ru)"
   },
   "content_scripts": [
     {
@@ -21,17 +21,7 @@
       "js": ["iframe-isolated.js"],
       "run_at": "document_start",
       "all_frames": true
-    },
-    {
-      "matches": [
-        "https://vk.com/ezhiky_game*",
-        "https://vk.com/app*",
-        "https://m.vk.com/ezhiky_game*",
-        "https://m.vk.com/app*"
-      ],
-      "js": ["vk-launcher.js"],
-      "run_at": "document_idle"
     }
   ],
-  "host_permissions": ["https://valley.redspell.ru/*", "https://vk.com/*", "https://m.vk.com/*"]
+  "host_permissions": ["https://valley.redspell.ru/*"]
 }

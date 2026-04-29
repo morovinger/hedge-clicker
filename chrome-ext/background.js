@@ -2,15 +2,20 @@
 // iframe, so we can dispatch trusted (isTrusted: true) mouse events.
 // Synthetic events from the page context are filtered by PIXI's
 // interaction manager — these aren't.
+//
+// The toolbar action just opens https://valley.redspell.ru/ — that page
+// pulls the user's VK session from cookies automatically, no
+// token-juggling needed.
 
-let attached = null; // { targetId } once attached
-let attaching = null; // in-flight attach promise
+const HC_BG_VERSION = '0.4.0';
+const GAME_URL = 'https://valley.redspell.ru/';
+console.log('[HC-BG] service worker started, version', HC_BG_VERSION);
+
+let attached = null;   // { targetId } once attached
+let attaching = null;  // in-flight attach promise
 
 async function findTarget() {
   const targets = await chrome.debugger.getTargets();
-  // Match any target whose URL contains valley.redspell.ru, regardless
-  // of type — Chrome reports iframes as 'iframe' or 'other' depending
-  // on isolation.
   return targets.find(t => t.url && t.url.indexOf('valley.redspell.ru') >= 0);
 }
 
@@ -55,7 +60,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     dispatchClick(msg.x, msg.y)
       .then(() => sendResponse({ ok: true }))
       .catch(err => sendResponse({ ok: false, error: String(err && err.message || err) }));
-    return true; // async
+    return true;
   }
   if (msg.type === 'HC_DBG_PING') {
     ensureAttached()
@@ -80,32 +85,21 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   attached = null;
 });
 
-// ── Toolbar action: open game with last captured VK URL ──
-// vk-launcher.js writes `lastGameUrl` to chrome.storage.local whenever the
-// VK app page mounts the game iframe. Clicking the extension toolbar
-// icon opens that URL in a new tab — no copy-pasting tokens needed.
-chrome.action.onClicked.addListener(async () => {
-  try {
-    const { lastGameUrl } = await chrome.storage.local.get('lastGameUrl');
-    if (!lastGameUrl || !lastGameUrl.url) {
-      // No URL captured yet — open the VK launcher so vk-launcher.js can grab one.
-      chrome.tabs.create({ url: 'https://vk.com/ezhiky_game' });
-      console.log('[HC-BG] no stored game URL — opened VK launcher');
-      return;
-    }
-    // Sanity: warn if the captured URL's expire= is in the past.
-    const m = /[?&]expire=(\d+)/.exec(lastGameUrl.url);
-    if (m) {
-      const exp = parseInt(m[1], 10) * 1000;
-      if (exp < Date.now()) {
-        console.log('[HC-BG] stored URL expired — opening VK launcher to refresh');
-        chrome.tabs.create({ url: 'https://vk.com/ezhiky_game' });
-        return;
-      }
-    }
-    chrome.tabs.create({ url: lastGameUrl.url });
-  } catch (e) {
-    console.warn('[HC-BG] action.onClicked failed', e);
-    chrome.tabs.create({ url: 'https://vk.com/ezhiky_game' });
-  }
+// ── Toolbar action ──
+// Single click → open the game in a new tab. valley.redspell.ru pulls
+// the VK session from cookies automatically; no token URL needed.
+chrome.action.onClicked.addListener(() => {
+  chrome.tabs.create({ url: GAME_URL });
 });
+
+// Set version badge so users can see at a glance which build is loaded.
+async function onBoot() {
+  try {
+    await chrome.action.setBadgeText({ text: HC_BG_VERSION.slice(2) }); // "4.0"
+    await chrome.action.setBadgeBackgroundColor({ color: '#3a7' });
+    await chrome.action.setTitle({ title: 'Hedgehog Vision v' + HC_BG_VERSION + ' — open Ёжики' });
+  } catch (e) {}
+}
+chrome.runtime.onInstalled.addListener(onBoot);
+chrome.runtime.onStartup.addListener(onBoot);
+onBoot();
