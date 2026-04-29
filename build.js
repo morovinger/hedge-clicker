@@ -11,8 +11,8 @@ const SRC = path.join(__dirname, 'src');
 const PASTE_OUT = path.join(__dirname, 'clicker.js');
 const EXT_OUT = path.join(__dirname, 'chrome-ext', 'iframe-script.js');
 
-// Load order matters: config → capture → vision → clicker → visit → ui
-const modules = ['config.js', 'glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js', 'vision.js', 'clicker.js', 'overlay.js', 'visit.js', 'ui.js'];
+// Load order matters: capture stub first, then GL/network spies, then visit + ui.
+const modules = ['glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js', 'overlay.js', 'visit.js', 'ui.js'];
 
 function readModules() {
   return modules.map(file => ({
@@ -53,7 +53,6 @@ function buildPasteBundle(mods) {
   const footer = `
   // ── Init ──
   console.log('[HC] Hedgehog Vision loaded! Canvas:', HC_Capture.canvas.width + 'x' + HC_Capture.canvas.height);
-  console.log('[HC] Targets:', HC_CFG.targets.map(t => t.name).join(', ') || 'NONE — use Calibrate to set up');
   console.log('[HC] Press F2 or START to begin.');
 `;
 
@@ -108,31 +107,16 @@ function buildExtBundle(mods) {
         let value;
         switch (m.cmd) {
           case 'ping':         value = {ok: true, canvas: HC_Capture.canvas ? [HC_Capture.canvas.width, HC_Capture.canvas.height] : null, ready: HC_Capture.isReady()}; break;
-          case 'start':        HC_Clicker.start(); value = HC_Clicker.getStats(); break;
-          case 'stop':         HC_Clicker.stop(); value = HC_Clicker.getStats(); break;
-          case 'setMode':      HC_Clicker.setMode(args[0]); value = HC_Clicker.getMode(); break;
-          case 'scan':         HC_Clicker.scanOnce(); value = 'scan triggered'; break;
-          case 'getStats':     value = HC_Clicker.getStats(); break;
           case 'visitStart':   HC_Visit.start(); value = HC_Visit.getStats(); break;
           case 'visitStop':    HC_Visit.stop(); value = HC_Visit.getStats(); break;
           case 'visitStats':   value = HC_Visit.getStats(); break;
           case 'setHomeBtn':   HC_Visit.setHomeBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
           case 'setVoyageBtn': HC_Visit.setVoyageBtn(args[0], args[1]); value = HC_Visit.getButtons(); break;
-          case 'click':        // raw click at canvas (x, y)
-            HC_Clicker.setMode('single');
-            HC_Clicker.setTarget(args[0], args[1]);
-            // single mode loops; for one-shot use the internal click
-            // — easier: call the dispatch directly via a tiny helper below
-            value = 'queued';
-            break;
-          case 'getCfg':       value = HC_CFG; break;
-          case 'setCfg':       Object.assign(HC_CFG, args[0]); value = HC_CFG; break;
           // ── PIXI scene-graph probes ──
           case 'eval': {
             // Debug-only: evaluate arbitrary JS in iframe context. Returns serializable result.
-            // The arg is a string that will be wrapped in (function(){ return ... })().
-            const fn = new Function('HC_Scene', 'HC_Capture', 'HC_Vision', 'HC_Clicker', 'HC_Visit', 'HC_CFG', args[0]);
-            value = await Promise.resolve(fn(window.HC_Scene, window.HC_Capture, window.HC_Vision, window.HC_Clicker, window.HC_Visit, window.HC_CFG));
+            const fn = new Function('HC_Scene', 'HC_Capture', 'HC_Visit', args[0]);
+            value = await Promise.resolve(fn(window.HC_Scene, window.HC_Capture, window.HC_Visit));
             break;
           }
           case 'glSpy': value = HC_GLSpy.getStats(); break;
@@ -330,39 +314,6 @@ function buildExtBundle(mods) {
             value = { count: list.length, canvases: list, hookedCanvasIs: HC_Capture.canvas === document.querySelector('canvas') ? 'first' : 'other' };
             break;
           }
-          case 'capState':      value = HC_Capture.getCaptureState(); break;
-          case 'dumpFrameStats': {
-            const fd = HC_Capture.getFrame();
-            if (!fd) { value = { hasFrame: false, capState: HC_Capture.getCaptureState() }; break; }
-            // sample 100 random pixels and bucket by HSL
-            const { data, width: w, height: h } = fd;
-            const buckets = {};
-            let blackCount = 0;
-            for (let n = 0; n < 200; n++) {
-              const x = Math.floor(Math.random() * w);
-              const y = Math.floor(Math.random() * h);
-              const i = (y * w + x) * 4;
-              const r = data[i], g = data[i+1], b = data[i+2];
-              if (r === 0 && g === 0 && b === 0) { blackCount++; continue; }
-              const hsl = HC_Vision.rgbToHsl(r, g, b);
-              const hb = Math.floor(hsl[0] / 30) * 30;
-              buckets[hb] = (buckets[hb] || 0) + 1;
-            }
-            value = { hasFrame: true, w, h, age: Date.now() - fd.time, blackCount, hueBuckets: buckets, drawCalls: HC_Capture.getDrawCallCount() };
-            break;
-          }
-          case 'rawScan': {
-            // Run scan with very low minCluster to see all hits
-            const orig = HC_CFG.minCluster;
-            HC_CFG.minCluster = 1;
-            HC_Capture.requestFrame();
-            value = await new Promise(res => setTimeout(() => {
-              const r = HC_Vision.scanFrame(HC_Capture.getFrame(), HC_CFG);
-              HC_CFG.minCluster = orig;
-              res({ clusterCount: r.length, clusters: r.slice(0, 20) });
-            }, 400));
-            break;
-          }
           default:             return reply(false, null, 'unknown cmd: ' + m.cmd);
         }
         reply(true, value);
@@ -376,14 +327,13 @@ function buildExtBundle(mods) {
 
   const footer = `
     console.log('[HC-Ext] Hedgehog Vision ready. Canvas:', HC_Capture.canvas.width + 'x' + HC_Capture.canvas.height);
-    console.log('[HC-Ext] Targets:', HC_CFG.targets.map(t => t.name).join(', ') || 'NONE');
   });  // end whenReady
 `;
 
-  // Eager modules: run immediately at document_start. config has no DOM deps;
-  // capture is a thin canvas locator; scenegraph installs no hooks but is safe
-  // to load early so its discover() can run any time.
-  const eagerFiles = new Set(['config.js', 'glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js']);
+  // Eager modules: run immediately at document_start. capture is a thin
+  // canvas locator; scenegraph installs no hooks but is safe to load early
+  // so its discover() can run any time.
+  const eagerFiles = new Set(['glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js']);
   const eagerMods = mods.filter(m => eagerFiles.has(m.file));
   const lazyMods = mods.filter(m => !eagerFiles.has(m.file));
 

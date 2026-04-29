@@ -19,7 +19,7 @@ window.HC_Visit = (function() {
   // Static UI button coords (canvas-relative, 1000×700).
   const BTN = {
     home:     { x: 80,  y: 660 }, // "Выйти" — bottom-left, returns from friend farm
-    next:     { x: 0,   y: 0   }, // "Далее" — bottom (right of home), advances to next friend farm. SET via setNextBtn
+    next:     { x: 200, y: 660 }, // "Далее" — bottom (right of home), advances to next friend farm
     voyage:   { x: 765, y: 260 }, // "В путь!" on TRAVELS_HUB
     travels:  { x: 0,   y: 0   }, // "Путешествия" on main farm — TBD
     sessionEndOk: { x: 0, y: 0 }, // confirm on "backpack full" dialog — TBD
@@ -37,12 +37,11 @@ window.HC_Visit = (function() {
     clickGap:         300,   // ms between blind clicks during a sweep (no per-cell await)
     settleAfterSweep: 1800,  // ms to wait after sweep for last responses to arrive
     advanceWait:      2500,  // ms after clicking "Далее"/"Выйти" for next farm to load
-    maxSweepsPerFarm: 4,     // bound how many full passes we do per farm
-    // Threshold: net.totalOk delta from one sweep that counts as "real
-    // collection". Below this, we treat the sweep as failed (probably just
-    // background polls) and advance to the next farm. Tuned for ~38s sweep
-    // time during which the game emits maybe 1-2 unrelated polls.
-    minOkPerSweep:    3,
+    maxSweepsPerFarm: 1,     // one full grid pass per farm, then advance.
+                             // Background tiles also return 0x80 OK so the
+                             // gained-oks threshold can't reliably tell an
+                             // exhausted farm from a fresh one; just advance.
+    minOkPerSweep:    3,     // unused when maxSweepsPerFarm=1, kept for manual override
     // 'auto' = use parsed list when HC_Net has decoded objects AND the
     // projected coords land inside the canvas; else fall back to grid.
     // 'parsed' = require parsed list (skip farm if missing).
