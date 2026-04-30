@@ -13,7 +13,8 @@ if (window.HC_Net) {
 } else {
 window.HC_Net = (function() {
   let totalOk = 0, totalErr = 0, totalSeen = 0, totalTick = 0, total200 = 0;
-  let lastOkAt = 0, lastErrAt = 0, lastResponseAt = 0;
+  let totalLoad = 0; // server-push / state-load envelope ('\x05\x00')
+  let lastOkAt = 0, lastErrAt = 0, lastResponseAt = 0, lastLoadAt = 0;
 
   // Ring buffer of recent (request, response) pairs for offline decoding.
   const RING_MAX = 32;
@@ -61,31 +62,37 @@ window.HC_Net = (function() {
         this.addEventListener('load', () => {
           totalSeen++;
           lastResponseAt = Date.now();
-          let ok = false, tick = false, http200 = false;
+          let ok = false, tick = false, load = false, http200 = false;
           let envelope = null;
           let respBytes = null;
           try { http200 = this.status === 200; } catch (e) {}
           try {
             if (this.response instanceof ArrayBuffer) {
               respBytes = Array.from(new Uint8Array(this.response));
-              // Envelope discrimination: 0x50 0x00 ('P\0') = click-acknowledged
-              // (action produced state change — friend-farm collects). 0x30 0x00
-              // ('0\0') = background tick (no action). Both are HTTP 200.
+              // Envelope discrimination (3 known kinds, all HTTP 200):
+              //   0x50 0x00 ('P\0')  click-acknowledged (collect action) →  ok
+              //   0x30 0x00 ('0\0')  background heartbeat / idle tick    →  tick
+              //   0x05 0x00 (\x05\0) server state push (initial session
+              //                       load AND friend-farm load XHR — hub
+              //                       probes returning a 594KB body land here)
+              //                                                           →  load
               if (respBytes.length >= 2 && respBytes[1] === 0x00) {
                 if (respBytes[0] === 0x50)      { ok = true;   envelope = 'P'; }
                 else if (respBytes[0] === 0x30) { tick = true; envelope = '0'; }
+                else if (respBytes[0] === 0x05) { load = true; envelope = '\\x05'; }
                 else                            { envelope = String.fromCharCode(respBytes[0]); }
               }
             }
           } catch (e) {}
           if (http200) total200++;
-          if (ok)        { totalOk++;   lastOkAt  = lastResponseAt; }
+          if (ok)        { totalOk++;   lastOkAt   = lastResponseAt; }
           else if (tick) { totalTick++; }
-          else           { totalErr++;  lastErrAt = lastResponseAt; }
+          else if (load) { totalLoad++; lastLoadAt = lastResponseAt; }
+          else           { totalErr++;  lastErrAt  = lastResponseAt; }
           pushRing({
             url: reqUrl,
             reqAt, respAt: lastResponseAt,
-            ok, tick, http200, envelope,
+            ok, tick, load, http200, envelope,
             reqLen: reqBytes ? reqBytes.length : 0,
             respLen: respBytes ? respBytes.length : 0,
             req: reqBytes,
@@ -212,12 +219,15 @@ window.HC_Net = (function() {
 
   // Cheap "is there a farm-load in the ring, and what's its seq?" — no
   // packet parsing. opts: { minRespLen: number }. Returns null if none.
+  // Farm-loads carry the server-push envelope ('\x05\x00'), classified as
+  // `load`, NOT the action-ack envelope ('\x50\x00'). Older builds keyed on
+  // `e.ok` and missed every farm-load — be sure to recognize `e.load` too.
   function lastFarmLoadSeq(opts) {
     opts = opts || {};
     const minLen = opts.minRespLen || 8000;
     for (let i = ring.length - 1; i >= 0; i--) {
       const e = ring[i];
-      if (e.ok && e.respLen >= minLen && e.resp) return e.seq;
+      if ((e.load || e.ok) && e.respLen >= minLen && e.resp) return e.seq;
     }
     return null;
   }
@@ -247,7 +257,9 @@ window.HC_Net = (function() {
     let pick = null;
     for (let i = ring.length - 1; i >= 0; i--) {
       const e = ring[i];
-      if (!e.ok) continue;
+      // Farm-load is the server-push envelope (load=true). Older builds also
+      // saw it via the action-ack path on some calls, so accept ok=true too.
+      if (!(e.load || e.ok)) continue;
       if (e.respLen < minLen) continue;
       if (!e.resp) continue;
       pick = e; break;
@@ -266,14 +278,98 @@ window.HC_Net = (function() {
     };
   }
 
+  // ── Click-response (collect-action) parser ──
+  // Every P\0 (action-ok) response carries the *server-side delta* for that
+  // click. Format observed (n=32, 2026-05-01 session, ra_leaf / ra_bark /
+  // ra_maple_syrup samples — all ~56–71 bytes):
+  //   50 00                 envelope
+  //   04 3d 00              fixed sub-header
+  //   <uint32 LE inner-len> bytes that follow excluding the leading 9
+  //   <uint16 LE recCount>
+  //   recCount × {
+  //     <uint16 LE name-len>
+  //     <name-len ASCII bytes>      e.g. "Exp" "Coins" "Energy" "ra_leaf"
+  //     <uint32 LE value>           positive integer; counter delta
+  //   }
+  // Resource records are the `ra_*` (or non-Exp/Coins/Energy) names — those
+  // are the tangible loot. Exp/Coins/Energy show up on every collect.
+  // When the backpack fills up (or the cell is empty) the server may still
+  // return P\0 but with NO ra_* record — that's the signal we want.
+  const META_NAMES = new Set(['Exp', 'Coins', 'Energy']);
+
+  function parseCollectResp(bytes) {
+    if (!bytes || bytes.length < 11) return null;
+    if (bytes[0] !== 0x50 || bytes[1] !== 0x00) return null; // not a P\0 ack
+    let i = 2;
+    // Skip 3-byte sub-header (04 3d 00) — tolerated, not validated, in case
+    // the server tweaks middle bytes.
+    i += 3;
+    // inner-len (uint32 LE) — for sanity only
+    if (i + 4 > bytes.length) return null;
+    const innerLen = bytes[i] | (bytes[i+1]<<8) | (bytes[i+2]<<16) | (bytes[i+3]<<24);
+    i += 4;
+    if (i + 2 > bytes.length) return null;
+    const recCount = bytes[i] | (bytes[i+1]<<8);
+    i += 2;
+    const records = [];
+    for (let r = 0; r < recCount; r++) {
+      if (i + 2 > bytes.length) break;
+      const nameLen = bytes[i] | (bytes[i+1]<<8);
+      i += 2;
+      if (i + nameLen + 4 > bytes.length) break;
+      let name = '';
+      for (let j = 0; j < nameLen; j++) name += String.fromCharCode(bytes[i + j]);
+      i += nameLen;
+      const value = bytes[i] | (bytes[i+1]<<8) | (bytes[i+2]<<16) | (bytes[i+3]<<24);
+      i += 4;
+      records.push({ name, value });
+    }
+    const resources = records.filter(r => !META_NAMES.has(r.name));
+    return { recCount, records, resources, innerLen };
+  }
+
+  // Aggregate parseCollectResp across the recent click responses. Useful
+  // signal for the visit loop: "did this sweep collect any ra_* items?"
+  // opts: { sinceMs?: number, sinceSeq?: number }
+  function lastCollectStats(opts) {
+    opts = opts || {};
+    const sinceTs = opts.sinceMs ? Date.now() - opts.sinceMs : 0;
+    const sinceSeq = opts.sinceSeq != null ? opts.sinceSeq : 0;
+    let acks = 0, withResources = 0, withoutResources = 0;
+    const totals = {}; // name → summed value
+    let last = null;
+    for (const e of ring) {
+      if (!e.ok) continue;
+      if (e.respAt < sinceTs) continue;
+      if (e.seq <= sinceSeq) continue;
+      if (!e.resp) continue;
+      const p = parseCollectResp(e.resp);
+      if (!p) continue;
+      acks++;
+      if (p.resources.length) withResources++; else withoutResources++;
+      for (const r of p.records) totals[r.name] = (totals[r.name] || 0) + r.value;
+      last = { seq: e.seq, respAt: e.respAt, records: p.records };
+    }
+    const resourceItems = Object.entries(totals)
+      .filter(([n]) => !META_NAMES.has(n))
+      .reduce((s, [, v]) => s + v, 0);
+    return {
+      acks, withResources, withoutResources,
+      totals, resourceItems,
+      last,
+    };
+  }
+
   return {
     awaitNextResponse,
     getStats() {
-      return { totalSeen, totalOk, totalErr, totalTick, total200, lastOkAt, lastErrAt, lastResponseAt, ringLen: ring.length };
+      return { totalSeen, totalOk, totalErr, totalTick, totalLoad, total200, lastOkAt, lastErrAt, lastLoadAt, lastResponseAt, ringLen: ring.length };
     },
     dump,
     clearRing,
     parseFarmLoad,
+    parseCollectResp,
+    lastCollectStats,
     lastFarmObjects,
     lastFarmLoadSeq,
     awaitNextFarmLoad,

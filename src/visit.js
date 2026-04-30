@@ -124,9 +124,12 @@ window.HC_Visit = (function() {
   // settles. The raw clicks themselves are reliable; only our per-cell
   // timing window was flaky.
   // forStop: honor running flag for early termination (true for loop,
-  // false for one-off sweepOnce).
+  // false for one-off sweepOnce). Returns { ok, resourceItems, withResources }.
   async function farmPass(forStop) {
-    const okBefore = net.getStats().totalOk;
+    const before = net.getStats();
+    const seqStart = before.totalSeen ? Math.max(0, before.totalSeen) : 0;
+    // Use server time as the "since" cutoff — ring entries carry respAt.
+    const cutoffTs = Date.now();
     for (const y of GRID_Y) {
       for (const x of GRID_X) {
         if (forStop && !running) break;
@@ -136,13 +139,14 @@ window.HC_Visit = (function() {
       }
       if (forStop && !running) break;
     }
-    // Let final responses arrive
     await sleep(VCFG.settleAfterSweep);
-    const okAfter = net.getStats().totalOk;
-    const gained = okAfter - okBefore;
+    const after = net.getStats();
+    const gained = after.totalOk - before.totalOk;
+    // Aggregate the parsed collect responses for *this* sweep window.
+    const collect = (net.lastCollectStats && net.lastCollectStats({ sinceMs: Date.now() - cutoffTs + 100 })) || null;
     stats.hits += gained;
-    stats.lastResult = 'sweep+' + gained;
-    return gained;
+    stats.lastResult = 'sweep ok=' + gained + (collect ? ' items=' + collect.resourceItems + ' (resp ' + collect.withResources + '/' + collect.acks + ')' : '');
+    return { ok: gained, resourceItems: collect ? collect.resourceItems : 0, withResources: collect ? collect.withResources : 0, ackCount: collect ? collect.acks : 0 };
   }
 
   // Project parsed world objects to in-canvas screen coords using HC_Overlay's
@@ -167,6 +171,7 @@ window.HC_Visit = (function() {
   async function parsedPass(forStop) {
     const list = projectedClickList();
     if (!list || list.length === 0) return null; // signal to caller to fall back
+    const cutoffTs = Date.now();
     const okBefore = net.getStats().totalOk;
     for (const c of list) {
       if (forStop && !running) break;
@@ -177,16 +182,17 @@ window.HC_Visit = (function() {
     }
     await sleep(VCFG.settleAfterSweep);
     const gained = net.getStats().totalOk - okBefore;
+    const collect = (net.lastCollectStats && net.lastCollectStats({ sinceMs: Date.now() - cutoffTs + 100 })) || null;
     stats.hits += gained;
-    stats.lastResult = 'parsed' + list.length + '+' + gained;
-    return gained;
+    stats.lastResult = 'parsed' + list.length + ' ok=' + gained + (collect ? ' items=' + collect.resourceItems : '');
+    return { ok: gained, resourceItems: collect ? collect.resourceItems : 0, withResources: collect ? collect.withResources : 0, ackCount: collect ? collect.acks : 0 };
   }
 
   async function runSweep(forStop) {
     if (VCFG.sweepMode === 'grid') return farmPass(forStop);
     if (VCFG.sweepMode === 'parsed') {
       const g = await parsedPass(forStop);
-      return g == null ? 0 : g;
+      return g == null ? { ok: 0, resourceItems: 0, withResources: 0, ackCount: 0 } : g;
     }
     // auto: prefer parsed, fall back to grid
     const g = await parsedPass(forStop);
@@ -241,12 +247,30 @@ window.HC_Visit = (function() {
       log('Already in a farm — skipping hub bootstrap');
     }
 
+    let zeroCollectSweeps = 0;
     while (running) {
       const seqBeforeSweep = net.lastFarmLoadSeq();
       log('--- pass ' + (stats.passes + 1) + ' starting (seq=' + seqBeforeSweep + ') ---');
-      const gained = await runSweep(true);
+      const r = await runSweep(true);
       stats.passes++;
-      log('sweep done: gained=' + gained + ' totalAttempts=' + stats.attempts + ' clickFails=' + clickFails);
+      log('sweep done: ok=' + r.ok + ' items=' + r.resourceItems + ' (resp ' + r.withResources + '/' + r.ackCount + ') totalAttempts=' + stats.attempts + ' clickFails=' + clickFails);
+
+      // Server-side signal: if EVERY P\0 ack we got back included no ra_*
+      // resource record, the backpack is full (or the farm has nothing left
+      // to give). Two such sweeps in a row → stop. This is the byte-level
+      // signal the previous version was lacking; it's far more decisive
+      // than the empty-advance counter.
+      if (r.ackCount > 0 && r.withResources === 0) {
+        zeroCollectSweeps++;
+        log('zero-resource sweep #' + zeroCollectSweeps + ' (acks=' + r.ackCount + ', items=0) — likely backpack full or farm exhausted');
+        if (zeroCollectSweeps >= 2) {
+          log('STOP: 2 consecutive sweeps with no ra_* collected — backpack likely full');
+          running = false;
+          return;
+        }
+      } else if (r.resourceItems > 0) {
+        zeroCollectSweeps = 0;
+      }
 
       // Try multiple advance candidates: the popup-center Далее (only present
       // when the farm is fully exhausted) AND the bottom-left Далее (always

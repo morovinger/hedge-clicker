@@ -39,12 +39,19 @@ async function ensureAttached() {
   finally { attaching = null; }
 }
 
+function withTimeout(p, ms, label) {
+  return Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout:' + label + ':' + ms + 'ms')), ms)),
+  ]);
+}
+
 async function dispatchClick(x, y) {
   const tgt = await ensureAttached();
   const base = { x, y, button: 'left', buttons: 1, clickCount: 1 };
-  await chrome.debugger.sendCommand(tgt, 'Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' });
-  await chrome.debugger.sendCommand(tgt, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' });
-  await chrome.debugger.sendCommand(tgt, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' });
+  await withTimeout(chrome.debugger.sendCommand(tgt, 'Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }),    1500, 'mouseMoved');
+  await withTimeout(chrome.debugger.sendCommand(tgt, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }),  1500, 'mousePressed');
+  await withTimeout(chrome.debugger.sendCommand(tgt, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }), 1500, 'mouseReleased');
 }
 
 async function detach() {

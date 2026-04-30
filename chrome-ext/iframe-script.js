@@ -345,7 +345,8 @@
   } else {
   window.HC_Net = (function() {
     let totalOk = 0, totalErr = 0, totalSeen = 0, totalTick = 0, total200 = 0;
-    let lastOkAt = 0, lastErrAt = 0, lastResponseAt = 0;
+    let totalLoad = 0; // server-push / state-load envelope ('\x05\x00')
+    let lastOkAt = 0, lastErrAt = 0, lastResponseAt = 0, lastLoadAt = 0;
   
     // Ring buffer of recent (request, response) pairs for offline decoding.
     const RING_MAX = 32;
@@ -393,31 +394,37 @@
           this.addEventListener('load', () => {
             totalSeen++;
             lastResponseAt = Date.now();
-            let ok = false, tick = false, http200 = false;
+            let ok = false, tick = false, load = false, http200 = false;
             let envelope = null;
             let respBytes = null;
             try { http200 = this.status === 200; } catch (e) {}
             try {
               if (this.response instanceof ArrayBuffer) {
                 respBytes = Array.from(new Uint8Array(this.response));
-                // Envelope discrimination: 0x50 0x00 ('P\0') = click-acknowledged
-                // (action produced state change — friend-farm collects). 0x30 0x00
-                // ('0\0') = background tick (no action). Both are HTTP 200.
+                // Envelope discrimination (3 known kinds, all HTTP 200):
+                //   0x50 0x00 ('P\0')  click-acknowledged (collect action) →  ok
+                //   0x30 0x00 ('0\0')  background heartbeat / idle tick    →  tick
+                //   0x05 0x00 (\x05\0) server state push (initial session
+                //                       load AND friend-farm load XHR — hub
+                //                       probes returning a 594KB body land here)
+                //                                                           →  load
                 if (respBytes.length >= 2 && respBytes[1] === 0x00) {
                   if (respBytes[0] === 0x50)      { ok = true;   envelope = 'P'; }
                   else if (respBytes[0] === 0x30) { tick = true; envelope = '0'; }
+                  else if (respBytes[0] === 0x05) { load = true; envelope = '\\x05'; }
                   else                            { envelope = String.fromCharCode(respBytes[0]); }
                 }
               }
             } catch (e) {}
             if (http200) total200++;
-            if (ok)        { totalOk++;   lastOkAt  = lastResponseAt; }
+            if (ok)        { totalOk++;   lastOkAt   = lastResponseAt; }
             else if (tick) { totalTick++; }
-            else           { totalErr++;  lastErrAt = lastResponseAt; }
+            else if (load) { totalLoad++; lastLoadAt = lastResponseAt; }
+            else           { totalErr++;  lastErrAt  = lastResponseAt; }
             pushRing({
               url: reqUrl,
               reqAt, respAt: lastResponseAt,
-              ok, tick, http200, envelope,
+              ok, tick, load, http200, envelope,
               reqLen: reqBytes ? reqBytes.length : 0,
               respLen: respBytes ? respBytes.length : 0,
               req: reqBytes,
@@ -544,12 +551,15 @@
   
     // Cheap "is there a farm-load in the ring, and what's its seq?" — no
     // packet parsing. opts: { minRespLen: number }. Returns null if none.
+    // Farm-loads carry the server-push envelope ('\x05\x00'), classified as
+    // `load`, NOT the action-ack envelope ('\x50\x00'). Older builds keyed on
+    // `e.ok` and missed every farm-load — be sure to recognize `e.load` too.
     function lastFarmLoadSeq(opts) {
       opts = opts || {};
       const minLen = opts.minRespLen || 8000;
       for (let i = ring.length - 1; i >= 0; i--) {
         const e = ring[i];
-        if (e.ok && e.respLen >= minLen && e.resp) return e.seq;
+        if ((e.load || e.ok) && e.respLen >= minLen && e.resp) return e.seq;
       }
       return null;
     }
@@ -579,7 +589,9 @@
       let pick = null;
       for (let i = ring.length - 1; i >= 0; i--) {
         const e = ring[i];
-        if (!e.ok) continue;
+        // Farm-load is the server-push envelope (load=true). Older builds also
+        // saw it via the action-ack path on some calls, so accept ok=true too.
+        if (!(e.load || e.ok)) continue;
         if (e.respLen < minLen) continue;
         if (!e.resp) continue;
         pick = e; break;
@@ -598,14 +610,98 @@
       };
     }
   
+    // ── Click-response (collect-action) parser ──
+    // Every P\0 (action-ok) response carries the *server-side delta* for that
+    // click. Format observed (n=32, 2026-05-01 session, ra_leaf / ra_bark /
+    // ra_maple_syrup samples — all ~56–71 bytes):
+    //   50 00                 envelope
+    //   04 3d 00              fixed sub-header
+    //   <uint32 LE inner-len> bytes that follow excluding the leading 9
+    //   <uint16 LE recCount>
+    //   recCount × {
+    //     <uint16 LE name-len>
+    //     <name-len ASCII bytes>      e.g. "Exp" "Coins" "Energy" "ra_leaf"
+    //     <uint32 LE value>           positive integer; counter delta
+    //   }
+    // Resource records are the `ra_*` (or non-Exp/Coins/Energy) names — those
+    // are the tangible loot. Exp/Coins/Energy show up on every collect.
+    // When the backpack fills up (or the cell is empty) the server may still
+    // return P\0 but with NO ra_* record — that's the signal we want.
+    const META_NAMES = new Set(['Exp', 'Coins', 'Energy']);
+  
+    function parseCollectResp(bytes) {
+      if (!bytes || bytes.length < 11) return null;
+      if (bytes[0] !== 0x50 || bytes[1] !== 0x00) return null; // not a P\0 ack
+      let i = 2;
+      // Skip 3-byte sub-header (04 3d 00) — tolerated, not validated, in case
+      // the server tweaks middle bytes.
+      i += 3;
+      // inner-len (uint32 LE) — for sanity only
+      if (i + 4 > bytes.length) return null;
+      const innerLen = bytes[i] | (bytes[i+1]<<8) | (bytes[i+2]<<16) | (bytes[i+3]<<24);
+      i += 4;
+      if (i + 2 > bytes.length) return null;
+      const recCount = bytes[i] | (bytes[i+1]<<8);
+      i += 2;
+      const records = [];
+      for (let r = 0; r < recCount; r++) {
+        if (i + 2 > bytes.length) break;
+        const nameLen = bytes[i] | (bytes[i+1]<<8);
+        i += 2;
+        if (i + nameLen + 4 > bytes.length) break;
+        let name = '';
+        for (let j = 0; j < nameLen; j++) name += String.fromCharCode(bytes[i + j]);
+        i += nameLen;
+        const value = bytes[i] | (bytes[i+1]<<8) | (bytes[i+2]<<16) | (bytes[i+3]<<24);
+        i += 4;
+        records.push({ name, value });
+      }
+      const resources = records.filter(r => !META_NAMES.has(r.name));
+      return { recCount, records, resources, innerLen };
+    }
+  
+    // Aggregate parseCollectResp across the recent click responses. Useful
+    // signal for the visit loop: "did this sweep collect any ra_* items?"
+    // opts: { sinceMs?: number, sinceSeq?: number }
+    function lastCollectStats(opts) {
+      opts = opts || {};
+      const sinceTs = opts.sinceMs ? Date.now() - opts.sinceMs : 0;
+      const sinceSeq = opts.sinceSeq != null ? opts.sinceSeq : 0;
+      let acks = 0, withResources = 0, withoutResources = 0;
+      const totals = {}; // name → summed value
+      let last = null;
+      for (const e of ring) {
+        if (!e.ok) continue;
+        if (e.respAt < sinceTs) continue;
+        if (e.seq <= sinceSeq) continue;
+        if (!e.resp) continue;
+        const p = parseCollectResp(e.resp);
+        if (!p) continue;
+        acks++;
+        if (p.resources.length) withResources++; else withoutResources++;
+        for (const r of p.records) totals[r.name] = (totals[r.name] || 0) + r.value;
+        last = { seq: e.seq, respAt: e.respAt, records: p.records };
+      }
+      const resourceItems = Object.entries(totals)
+        .filter(([n]) => !META_NAMES.has(n))
+        .reduce((s, [, v]) => s + v, 0);
+      return {
+        acks, withResources, withoutResources,
+        totals, resourceItems,
+        last,
+      };
+    }
+  
     return {
       awaitNextResponse,
       getStats() {
-        return { totalSeen, totalOk, totalErr, totalTick, total200, lastOkAt, lastErrAt, lastResponseAt, ringLen: ring.length };
+        return { totalSeen, totalOk, totalErr, totalTick, totalLoad, total200, lastOkAt, lastErrAt, lastLoadAt, lastResponseAt, ringLen: ring.length };
       },
       dump,
       clearRing,
       parseFarmLoad,
+      parseCollectResp,
+      lastCollectStats,
       lastFarmObjects,
       lastFarmLoadSeq,
       awaitNextFarmLoad,
@@ -629,8 +725,16 @@
   // ISOLATED-world bridge (iframe-isolated.js) forwards to the background
   // service worker (background.js) which calls Input.dispatchMouseEvent.
   //
-  // Coordinates are in the iframe's CSS viewport, which on this game is
-  // 1:1 with canvas pixels (canvas at (0,0), no scaling).
+  // Callers pass coordinates in the iframe's own CSS viewport (canvas-pixel
+  // coords, since the canvas fills the iframe at 1:1). When the iframe is
+  // SAME-ORIGIN with the top page (the case for the direct
+  // https://valley.redspell.ru/ entry — see memory: game_direct_url.md),
+  // chrome.debugger.getTargets returns one shared page target. background.js
+  // attaches to it and dispatches Input.dispatchMouseEvent in TOP-frame
+  // viewport space, so we add the iframe element's getBoundingClientRect()
+  // offset before sending. When the iframe is CROSS-ORIGIN (VK wrapper path)
+  // the iframe gets its own debugger target, no offset is needed; we detect
+  // that case by parent.document throwing.
   
   if (window.HC_DbgClick) {
     console.log('[HC] DbgClick already installed — reusing.');
@@ -639,6 +743,25 @@
     const pending = new Map();
     let nextId = 1;
     let available = null; // null = unknown, true/false set after first ping
+  
+    // Same-origin iframe → debugger target is shared with parent → coords
+    // need iframe offset added. Cross-origin parent throws; that's the OOPIF
+    // case where the iframe has its own debugger target and offset = 0.
+    // Memoized lightly because getBoundingClientRect changes when the page
+    // re-layouts (HC panel expand/collapse, window resize).
+    function parentIframeOffset() {
+      try {
+        if (window.parent === window) return null; // top frame, no parent
+        const list = window.parent.document.querySelectorAll('iframe');
+        for (const f of list) {
+          if (f.contentWindow === window) {
+            const r = f.getBoundingClientRect();
+            return { x: r.left, y: r.top };
+          }
+        }
+      } catch (e) { /* cross-origin parent: fall through */ }
+      return null;
+    }
   
     window.addEventListener('message', function(ev) {
       const m = ev.data;
@@ -662,8 +785,12 @@
   
     // Fire a click; returns Promise<{ok, error?}>. The caller usually
     // doesn't await (visit.js spaces clicks by clickGap), but await-able
-    // for debugging.
+    // for debugging. x/y are iframe-CSS coords; we translate to top-frame
+    // coords on the same-origin path because the debugger session is
+    // attached to the shared parent target.
     function click(x, y) {
+      const off = parentIframeOffset();
+      if (off) { x += off.x; y += off.y; }
       return send('HC_DBG_CLICK_REQ', { x, y }, 3000);
     }
   
@@ -1297,9 +1424,12 @@
       // settles. The raw clicks themselves are reliable; only our per-cell
       // timing window was flaky.
       // forStop: honor running flag for early termination (true for loop,
-      // false for one-off sweepOnce).
+      // false for one-off sweepOnce). Returns { ok, resourceItems, withResources }.
       async function farmPass(forStop) {
-        const okBefore = net.getStats().totalOk;
+        const before = net.getStats();
+        const seqStart = before.totalSeen ? Math.max(0, before.totalSeen) : 0;
+        // Use server time as the "since" cutoff — ring entries carry respAt.
+        const cutoffTs = Date.now();
         for (const y of GRID_Y) {
           for (const x of GRID_X) {
             if (forStop && !running) break;
@@ -1309,13 +1439,14 @@
           }
           if (forStop && !running) break;
         }
-        // Let final responses arrive
         await sleep(VCFG.settleAfterSweep);
-        const okAfter = net.getStats().totalOk;
-        const gained = okAfter - okBefore;
+        const after = net.getStats();
+        const gained = after.totalOk - before.totalOk;
+        // Aggregate the parsed collect responses for *this* sweep window.
+        const collect = (net.lastCollectStats && net.lastCollectStats({ sinceMs: Date.now() - cutoffTs + 100 })) || null;
         stats.hits += gained;
-        stats.lastResult = 'sweep+' + gained;
-        return gained;
+        stats.lastResult = 'sweep ok=' + gained + (collect ? ' items=' + collect.resourceItems + ' (resp ' + collect.withResources + '/' + collect.acks + ')' : '');
+        return { ok: gained, resourceItems: collect ? collect.resourceItems : 0, withResources: collect ? collect.withResources : 0, ackCount: collect ? collect.acks : 0 };
       }
     
       // Project parsed world objects to in-canvas screen coords using HC_Overlay's
@@ -1340,6 +1471,7 @@
       async function parsedPass(forStop) {
         const list = projectedClickList();
         if (!list || list.length === 0) return null; // signal to caller to fall back
+        const cutoffTs = Date.now();
         const okBefore = net.getStats().totalOk;
         for (const c of list) {
           if (forStop && !running) break;
@@ -1350,16 +1482,17 @@
         }
         await sleep(VCFG.settleAfterSweep);
         const gained = net.getStats().totalOk - okBefore;
+        const collect = (net.lastCollectStats && net.lastCollectStats({ sinceMs: Date.now() - cutoffTs + 100 })) || null;
         stats.hits += gained;
-        stats.lastResult = 'parsed' + list.length + '+' + gained;
-        return gained;
+        stats.lastResult = 'parsed' + list.length + ' ok=' + gained + (collect ? ' items=' + collect.resourceItems : '');
+        return { ok: gained, resourceItems: collect ? collect.resourceItems : 0, withResources: collect ? collect.withResources : 0, ackCount: collect ? collect.acks : 0 };
       }
     
       async function runSweep(forStop) {
         if (VCFG.sweepMode === 'grid') return farmPass(forStop);
         if (VCFG.sweepMode === 'parsed') {
           const g = await parsedPass(forStop);
-          return g == null ? 0 : g;
+          return g == null ? { ok: 0, resourceItems: 0, withResources: 0, ackCount: 0 } : g;
         }
         // auto: prefer parsed, fall back to grid
         const g = await parsedPass(forStop);
@@ -1414,12 +1547,30 @@
           log('Already in a farm — skipping hub bootstrap');
         }
     
+        let zeroCollectSweeps = 0;
         while (running) {
           const seqBeforeSweep = net.lastFarmLoadSeq();
           log('--- pass ' + (stats.passes + 1) + ' starting (seq=' + seqBeforeSweep + ') ---');
-          const gained = await runSweep(true);
+          const r = await runSweep(true);
           stats.passes++;
-          log('sweep done: gained=' + gained + ' totalAttempts=' + stats.attempts + ' clickFails=' + clickFails);
+          log('sweep done: ok=' + r.ok + ' items=' + r.resourceItems + ' (resp ' + r.withResources + '/' + r.ackCount + ') totalAttempts=' + stats.attempts + ' clickFails=' + clickFails);
+    
+          // Server-side signal: if EVERY P\0 ack we got back included no ra_*
+          // resource record, the backpack is full (or the farm has nothing left
+          // to give). Two such sweeps in a row → stop. This is the byte-level
+          // signal the previous version was lacking; it's far more decisive
+          // than the empty-advance counter.
+          if (r.ackCount > 0 && r.withResources === 0) {
+            zeroCollectSweeps++;
+            log('zero-resource sweep #' + zeroCollectSweeps + ' (acks=' + r.ackCount + ', items=0) — likely backpack full or farm exhausted');
+            if (zeroCollectSweeps >= 2) {
+              log('STOP: 2 consecutive sweeps with no ra_* collected — backpack likely full');
+              running = false;
+              return;
+            }
+          } else if (r.resourceItems > 0) {
+            zeroCollectSweeps = 0;
+          }
     
           // Try multiple advance candidates: the popup-center Далее (only present
           // when the farm is fully exhausted) AND the bottom-left Далее (always

@@ -27,6 +27,12 @@ window.addEventListener('message', function (ev) {
     chrome.runtime.sendMessage({ type: 'HC_DBG_TARGETS' }, function (resp) {
       window.postMessage({ type: 'HC_DBG_TARGETS_RES', id: m.id, resp }, '*');
     });
+    return;
+  }
+  if (m.type === 'HC_DBG_DETACH_REQ') {
+    chrome.runtime.sendMessage({ type: 'HC_DBG_DETACH' }, function (resp) {
+      window.postMessage({ type: 'HC_DBG_DETACH_RES', id: m.id, resp }, '*');
+    });
   }
 });
 
