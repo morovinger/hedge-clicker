@@ -210,6 +210,34 @@ window.HC_Net = (function() {
     return false;
   }
 
+  // Cheap "is there a farm-load in the ring, and what's its seq?" — no
+  // packet parsing. opts: { minRespLen: number }. Returns null if none.
+  function lastFarmLoadSeq(opts) {
+    opts = opts || {};
+    const minLen = opts.minRespLen || 8000;
+    for (let i = ring.length - 1; i >= 0; i--) {
+      const e = ring[i];
+      if (e.ok && e.respLen >= minLen && e.resp) return e.seq;
+    }
+    return null;
+  }
+
+  // Wait up to opts.timeoutMs (default 1500) for a farm-load XHR with seq
+  // strictly greater than opts.afterSeq. Returns the new seq or null on
+  // timeout. If afterSeq is omitted, uses the current lastFarmLoadSeq().
+  async function awaitNextFarmLoad(opts) {
+    opts = opts || {};
+    const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : 1500;
+    const afterSeq = opts.afterSeq != null ? opts.afterSeq : lastFarmLoadSeq();
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      const s = lastFarmLoadSeq();
+      if (s != null && s !== afterSeq) return s;
+      await new Promise(r => setTimeout(r, 120));
+    }
+    return null;
+  }
+
   // Find the most recent large /proto.html response (the farm-load) and
   // parse it. Returns { found, count, objects, source: {seq, respLen} }.
   // opts: { collectiblesOnly: bool, prefixes: string[], minRespLen: number }
@@ -247,6 +275,8 @@ window.HC_Net = (function() {
     clearRing,
     parseFarmLoad,
     lastFarmObjects,
+    lastFarmLoadSeq,
+    awaitNextFarmLoad,
     isCollectible,
     // Cheap "did anything succeed in the last N ms?" — useful for a passive
     // sanity check after a known game action.

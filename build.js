@@ -28,7 +28,7 @@ function indent(text, n = 2) {
 
 // ── Build #1: paste bundle ──
 function buildPasteBundle(mods) {
-  const header = `// Hedgehog Smart Collector (Ёжики) - Vision-based Auto-Clicker
+  const header = `// Hedgehog Clicker (Ёжики) — autonomous friend-farm collector
 // Built: ${new Date().toISOString().slice(0, 10)}
 //
 // HOW TO USE:
@@ -36,6 +36,10 @@ function buildPasteBundle(mods) {
 // 2. Press F12 → Console tab
 // 3. Switch context from "top" to "valley.redspell.ru" iframe
 // 4. Paste this script and press Enter
+//
+// NOTE: paste-mode does not get debugger-trusted clicks; the Visit loop
+// only works through the Chrome extension. Manual paste is for poking
+// at HC_Net / HC_Scene / HC_Overlay from DevTools.
 //
 // CONTROLS: F2 = toggle on/off
 `;
@@ -69,7 +73,7 @@ function buildPasteBundle(mods) {
 // our getContext hook beats PIXI. Defers everything else (UI, modules,
 // bridge) until HC_Capture has captured a real WebGL context.
 function buildExtBundle(mods) {
-  const header = `// Hedgehog Vision — Chrome extension content script (auto-injected into game iframe)
+  const header = `// Hedgehog Clicker — Chrome extension content script (auto-injected into game iframe)
 // Built: ${new Date().toISOString().slice(0, 10)}
 // Runs at document_start in MAIN world inside https://valley.redspell.ru/play/vk/index.html
 `;

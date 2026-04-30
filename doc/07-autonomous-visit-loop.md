@@ -50,13 +50,13 @@ manual tuning; the panel has matching pickers.
 
 `HC_Visit.start()` →
 
-1. `lastFarmSeq()` reads `HC_Net.lastFarmObjects().source.seq`. Null →
-   we're not in a farm (or the farm-load XHR aged out of `HC_Net`'s 32-
-   entry ring).
+1. `HC_Net.lastFarmLoadSeq()` returns the seq of the most recent
+   farm-load XHR in the ring (or null if none / it aged out of the
+   32-entry ring).
 2. If null, `enterFarmFromHub()` walks a coarse 5×4 grid over the hub
    playfield (`HUB_PROBES`, x=200–850 step 130, y=220–520 step 100, 24
-   total). After each click it polls `lastFarmSeq()` for up to
-   `hubProbeTimeout` ms; the first probe that increments the seq wins.
+   total). After each click it calls `HC_Net.awaitNextFarmLoad({ afterSeq, timeoutMs: hubProbeTimeout })`;
+   the first probe that produces a new seq wins.
 3. Main loop, while `running`:
     1. Capture `seqBeforeSweep`.
     2. Run one full grid pass (`farmPass`) — 14×9 = 126 cells, 300 ms
@@ -74,8 +74,9 @@ manual tuning; the panel has matching pickers.
 
 `maxSweepsPerFarm` was reduced from 4 → 1: a single full pass collects
 every instant-collect resource, and the gained-oks threshold can't tell
-an exhausted farm from a fresh one (background tiles also return
-`0x80 OK` on click, so even an empty farm produces ~50+ oks per sweep).
+an exhausted farm from a fresh one (background tiles also return the
+`0x50 0x00` (`P\0`) action-ok envelope on click, so even an empty farm
+produces ~50+ oks per sweep).
 
 ## Coordinate plumbing
 
@@ -143,7 +144,7 @@ multiplier before clicking.
 Single sweep on `наина haiha` farm:
 
 - 126 click attempts via `HC_DbgClick`.
-- 102 net `0x80 OK` responses gained.
+- 102 net `P\0` (action-ok) responses gained.
 - Resource bars 14/120, 12/115 → 25/120, 24/115 (collected 11 + 12 = 23
   visible items).
 - Game popped the "nothing more to do here" dialog with Далее button.

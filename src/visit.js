@@ -1,12 +1,12 @@
-// ── HC_Visit: hybrid auto-collect on friend farms ──
-// Drives the game by dispatching synthetic pointer events on the canvas
-// (proven to work — see exit-popup capture). Uses HC_Net's success oracle
-// (next /proto.html response after click → 0x80 = collect succeeded) to
-// distinguish real resource clicks from grass.
+// ── HC_Visit: autonomous friend-farm collector ──
+// Drives the game by dispatching trusted clicks via HC_DbgClick (the
+// extension's chrome.debugger bridge). Uses HC_Net's response stream
+// (each /proto.html post → 0x50 0x00 'P\0' = action ok, 0x30 0x00 '0\0' =
+// idle tick, 0x00 0x00 = error) as the post-click signal.
 //
-// Requires user to be inside a friend farm before start(). The "next farm"
-// popup confirm + main-farm "Путешествия" entry will be wired once we have
-// their canvas coords.
+// Caveat: background tiles also return P\0 on click, so the totalOk delta
+// only proves "the click reached the game", not "a resource was collected".
+// That's why maxSweepsPerFarm = 1 — there's no clean per-cell early-stop.
 
 if (window.HC_Visit) {
   console.log('[HC] Visit already installed — reusing.');
@@ -39,7 +39,7 @@ window.HC_Visit = (function() {
     settleAfterSweep: 1800,  // ms to wait after sweep for last responses to arrive
     advanceWait:      2500,  // ms after clicking "Далее"/"Выйти" for next farm to load
     maxSweepsPerFarm: 1,     // one full grid pass per farm, then advance.
-                             // Background tiles also return 0x80 OK so the
+                             // Background tiles also return P\0 (ok) so the
                              // gained-oks threshold can't reliably tell an
                              // exhausted farm from a fresh one; just advance.
     minOkPerSweep:    3,     // unused when maxSweepsPerFarm=1, kept for manual override
@@ -51,7 +51,9 @@ window.HC_Visit = (function() {
     // projected coords land inside the canvas; else fall back to grid.
     // 'parsed' = require parsed list (skip farm if missing).
     // 'grid' = always grid (legacy behavior).
-    sweepMode:        'auto',
+    // Default is 'grid' until HC_Overlay exposes a calibrated flag — the
+    // current overlay transform is a guess and parsed coords are unreliable.
+    sweepMode:        'grid',
     parsedClickGap:   220,   // tighter than grid because we have far fewer clicks
     // Inset around canvas edges to skip projected coords that land in UI
     // bands (top/bottom HUD, side rails).
@@ -201,34 +203,18 @@ window.HC_Visit = (function() {
     for (let x = 200; x <= 850; x += 130) HUB_PROBES.push({ x, y });
   }
 
-  // We're "in a farm" if HC_Net has parsed a farm-load XHR more recent than
-  // `sinceSeq`. Returns the new seq (or null if no farm-load yet).
-  function lastFarmSeq() {
-    const r = net.lastFarmObjects({ collectiblesOnly: false });
-    return r.found && r.source ? r.source.seq : null;
-  }
-
-  async function awaitFarmLoad(timeoutMs, sinceSeq) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeoutMs) {
-      const s = lastFarmSeq();
-      if (s != null && s !== sinceSeq) return s;
-      await sleep(120);
-    }
-    return null;
-  }
-
-  async function enterFarmFromHub() {
-    const startSeq = lastFarmSeq();
-    log('enterFarmFromHub: startSeq=' + startSeq + ' probeCount=' + HUB_PROBES.length);
+  async function enterFarmFromHub(opts) {
+    const requireRunning = !opts || opts.requireRunning !== false;
+    const startSeq = net.lastFarmLoadSeq();
+    log('enterFarmFromHub: startSeq=' + startSeq + ' probeCount=' + HUB_PROBES.length + ' requireRunning=' + requireRunning);
     let attempts = 0;
     for (const p of HUB_PROBES) {
-      if (!running) { log('enterFarmFromHub aborted: running=false'); break; }
+      if (requireRunning && !running) { log('enterFarmFromHub aborted: running=false'); break; }
       if (attempts >= VCFG.maxHubAttempts) { log('enterFarmFromHub: hit maxHubAttempts'); break; }
       attempts++;
       log('hub probe #' + attempts + ' @ canvas (' + p.x + ',' + p.y + ')');
       click(p.x, p.y);
-      const newSeq = await awaitFarmLoad(VCFG.hubProbeTimeout, startSeq);
+      const newSeq = await net.awaitNextFarmLoad({ afterSeq: startSeq, timeoutMs: VCFG.hubProbeTimeout });
       if (newSeq != null && newSeq !== startSeq) {
         log('ENTERED farm via probe #' + attempts + ' (' + p.x + ',' + p.y + ') seq=' + newSeq);
         await sleep(800);
@@ -242,9 +228,9 @@ window.HC_Visit = (function() {
 
   async function loop() {
     let emptyAdvances = 0;
-    log('loop start: lastFarmSeq=' + lastFarmSeq() + ' BTN.next=(' + BTN.next.x + ',' + BTN.next.y + ')');
+    log('loop start: lastFarmLoadSeq=' + net.lastFarmLoadSeq() + ' BTN.next=(' + BTN.next.x + ',' + BTN.next.y + ')');
 
-    if (lastFarmSeq() == null) {
+    if (net.lastFarmLoadSeq() == null) {
       log('Not inside a farm — bootstrapping via hub probe');
       if (!(await enterFarmFromHub())) {
         log('STOP: bootstrap failed');
@@ -256,7 +242,7 @@ window.HC_Visit = (function() {
     }
 
     while (running) {
-      const seqBeforeSweep = lastFarmSeq();
+      const seqBeforeSweep = net.lastFarmLoadSeq();
       log('--- pass ' + (stats.passes + 1) + ' starting (seq=' + seqBeforeSweep + ') ---');
       const gained = await runSweep(true);
       stats.passes++;
@@ -267,7 +253,7 @@ window.HC_Visit = (function() {
       // present once any collection happened). Whichever one actually exists
       // will produce the farm-load XHR; the other is a no-op.
       const advanced = await tryAdvance(seqBeforeSweep);
-      stats.farms++;
+      if (advanced) stats.farms++;
 
       if (!advanced) {
         emptyAdvances++;
@@ -305,7 +291,7 @@ window.HC_Visit = (function() {
       if (!running) return false;
       log('trying advance: ' + c.name + ' @ (' + c.x + ',' + c.y + ')');
       click(c.x, c.y);
-      const newSeq = await awaitFarmLoad(VCFG.advanceWait, seqBefore);
+      const newSeq = await net.awaitNextFarmLoad({ afterSeq: seqBefore, timeoutMs: VCFG.advanceWait });
       if (newSeq != null && newSeq !== seqBefore) {
         log('advance OK via ' + c.name + ' → seq=' + newSeq);
         await sleep(600); // settle in new farm

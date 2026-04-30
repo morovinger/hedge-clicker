@@ -84,7 +84,7 @@ window.HC_UI = (function() {
   });
   document.getElementById('hc-hub').addEventListener('click', () => {
     console.log('[HC_UI] Enter Hub Farm clicked');
-    visit.enterFarmFromHub().then(ok => console.log('[HC_UI] hub entry result:', ok));
+    visit.enterFarmFromHub({ requireRunning: false }).then(ok => console.log('[HC_UI] hub entry result:', ok));
   });
   document.getElementById('hc-probe').addEventListener('click', () => {
     if (!window.HC_DbgClick) { console.warn('no HC_DbgClick'); return; }

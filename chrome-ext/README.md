@@ -1,6 +1,6 @@
-# Hedgehog Vision — Chrome Extension
+# Hedgehog Clicker — Chrome Extension
 
-Auto-injects the HC_* clicker into the Ёжики game iframe so you don't have to paste it into DevTools every session.
+Auto-injects the `HC_*` stack into the Ёжики game iframe so you don't have to paste it into DevTools every session, and gives you a `chrome.debugger`-backed click path that PIXI actually accepts.
 
 ## Install (one-time)
 
@@ -8,7 +8,7 @@ Auto-injects the HC_* clicker into the Ёжики game iframe so you don't have 
 2. Open `chrome://extensions` in Chrome.
 3. Enable **Developer mode** (top-right toggle).
 4. Click **Load unpacked** and select this `chrome-ext/` folder.
-5. Open `https://vk.com/ezhiky_game`. The HC panel should appear automatically.
+5. Open `https://valley.redspell.ru/` (signed-in VK session) or `https://vk.com/ezhiky_game`. The HC panel should appear automatically.
 
 After editing source files, run `node build.js` and click the **Reload** button next to the extension card.
 
@@ -34,58 +34,48 @@ function send(cmd, ...args) {
 }
 
 // Usage:
-await send('ping');                          // {ok, value: {canvas: [w,h]}}
-await send('visitStart');
-await send('visitStats');                    // {visited, cycleClicks, running}
-await send('setCfg', {minCluster: 20});
-await send('sample', 500, 350);              // {h, s, l, r, g, b}
-await send('setHomeBtn', 80, 660);
-await send('stop');
+await send('ping');                      // {ok, canvas:[w,h], ready}
+await send('visitStart');                // start the autonomous loop
+await send('visitStats');                // {running, passes, hits, attempts, farms, ...}
+await send('visitSetCfg', {advanceWait: 3000});
+await send('netStats');                  // {totalSeen, totalOk, totalErr, ...}
+await send('dbgClick', 200, 660);        // canvas-coord click via chrome.debugger
+await send('visitStop');
 ```
 
 ## Available commands
 
-| cmd            | args                  | returns                        |
-|----------------|-----------------------|--------------------------------|
-| `ping`         | —                     | `{ok, canvas:[w,h]}`           |
-| `start`        | —                     | clicker stats                  |
-| `stop`         | —                     | clicker stats                  |
-| `setMode`      | `'smart'|'grid'|'single'` | current mode               |
-| `scan`         | —                     | `'scan triggered'`             |
-| `getStats`     | —                     | `{clicks, scans, found, ...}`  |
-| `visitStart`   | —                     | visit stats                    |
-| `visitStop`    | —                     | visit stats                    |
-| `visitStats`   | —                     | `{visited, cycleClicks, ...}`  |
-| `setHomeBtn`   | `x, y` (canvas px)    | `{home, voyage}`               |
-| `setVoyageBtn` | `x, y` (canvas px)    | `{home, voyage}`               |
-| `sample`       | `x, y` (canvas px)    | `{h, s, l, r, g, b}`           |
-| `getCfg`       | —                     | `HC_CFG` object                |
-| `setCfg`       | `{partial cfg}`       | merged `HC_CFG`                |
+The full handler list lives in `build.js` (search for `case '`). The most-used commands:
+
+| Group | Commands |
+|---|---|
+| Health | `ping` |
+| Visit loop | `visitStart`, `visitStop`, `visitStats`, `visitSweep`, `visitParsedSweep`, `visitSetMode`, `visitGetMode`, `visitGetCfg`, `visitSetCfg` |
+| Coord pickers | `setHomeBtn`, `visitSetNext`, `visitSetTravels`, `visitSetSessionEndOk`, `setVoyageBtn` |
+| Network observer | `netStats`, `netAwait`, `netDump`, `netClear`, `netFarmObjects`, `netFarmObjectsRaw` |
+| Debugger click | `dbgPing`, `dbgTargets`, `dbgClick` (canvas coords), `clickAt` (synthetic-event fallback) |
+| Overlay | `overlayShow`, `overlayHide`, `overlaySet`, `overlayGet`, `overlayCalibrate`, `overlayProject` |
+| GLSpy / scene graph | `glSpy`, `glSpyReset`, `glSpyFp`, `glSpyTextures`, `glSnap`, `glDiff`, `glWindow`, `pixiSummary`, `pixiTextures`, `pixiFindTex`, `pixiDiscover`, `pixiDeep`, `pixiGlobals`, `enumCanvases`, `pixiTrap` |
+| Escape hatch | `eval` (debug only — runs arbitrary JS in iframe context) |
+
+Every reply is shaped `{type: 'HC_RES', id, ok, value, error}`. Errors come back with `ok: false` and a stringified stack.
 
 ## Toolbar action
 
-Clicking the extension icon opens `https://valley.redspell.ru/` in a new
-tab. As long as you're signed into VK in the same Chrome profile, the
-vendor page pulls the session automatically — no token juggling needed.
+Clicking the extension icon opens `https://valley.redspell.ru/` in a new tab. As long as you're signed into VK in the same Chrome profile, the vendor page pulls the session automatically — no token juggling needed.
 
-The toolbar icon shows a small green badge with the version (e.g.
-`4.0`) so you can confirm at a glance which build is loaded.
+The toolbar icon shows a small green badge with the version (e.g. `4.0`) so you can confirm at a glance which build is loaded.
 
 ## Architecture
 
-- `manifest.json` — MV3. Content scripts target `valley.redspell.ru/*`
-  with `all_frames: true`. `iframe-script.js` runs in the MAIN world;
-  `iframe-isolated.js` runs in the ISOLATED world.
-- `iframe-script.js` — generated by `build.js`. Contains the entire
-  `HC_*` stack plus a `postMessage` bridge.
-- `iframe-isolated.js` — bridge between the MAIN-world `iframe-script`
-  and the background service worker (used by the debugger-click path).
-- `background.js` — owns the `chrome.debugger` session for trusted
-  clicks; handles the toolbar action and sets the version badge on
-  service-worker boot.
+- `manifest.json` — MV3. Content scripts target `valley.redspell.ru/*` with `all_frames: true`. `iframe-script.js` runs in the MAIN world; `iframe-isolated.js` runs in the ISOLATED world.
+- `iframe-script.js` — generated by `build.js`. Contains the entire `HC_*` stack (8 modules) plus the `postMessage` bridge.
+- `iframe-isolated.js` — bridge between the MAIN-world `iframe-script` and the background service worker (used by the debugger-click path).
+- `background.js` — owns the `chrome.debugger` session for trusted clicks; handles the toolbar action and sets the version badge on service-worker boot.
 
 ## Troubleshooting
 
-- **No panel appears**: open the iframe DevTools (right-click game → Inspect → switch context to `valley.redspell.ru`) and check console for `[HC-Ext]` logs.
-- **"No canvas after 60s"**: game didn't load. Refresh page.
+- **No panel appears**: open the iframe DevTools (right-click game → Inspect → switch context to `valley.redspell.ru`) and check the console for `[HC-Ext]` logs.
+- **"No canvas after 60s"**: game didn't load. Refresh.
 - **Bridge doesn't respond**: confirm you're posting to `iframe.contentWindow` and listening on `window` for `HC_RES`. Origin is `*`.
+- **Clicks fire but `netStats.totalOk` stays at 0**: another `chrome.debugger` session likely stole the attach (e.g. claude-in-chrome MCP, or DevTools opened on the iframe target). Detach it. `dbgPing` will still report ok in this state because `ensureAttached()` is a no-op once attached — the symptom is purely "events go in, game sees nothing."

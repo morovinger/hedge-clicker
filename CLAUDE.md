@@ -2,96 +2,102 @@
 
 ## Architecture
 
-Single-page injectable script targeting a PIXI.js WebGL game running inside a cross-origin iframe on VK (`valley.redspell.ru/play/vk/index.html`). The code is split into 5 modules that communicate via `window.HC_*` globals and are concatenated into one IIFE by `build.js`.
+Injectable / extension-bundled script targeting a PIXI.js WebGL game running inside a cross-origin iframe on VK (`valley.redspell.ru/play/vk/index.html`). The current build is **not** a vision pipeline — earlier HSL-based smart-mode (`config.js` / `vision.js` / `clicker.js`) was removed in #07 once the network-decoding path landed.
+
+The active pipeline drives friend-farm collection by:
+1. Observing `/proto.html` XHRs to know when collect actions succeed.
+2. Dispatching trusted clicks via a `chrome.debugger` session owned by the extension's background service worker.
+3. Sweeping a static grid (or, eventually, parsed object coords from the farm-load packet) over the canvas, then advancing to the next friend farm.
+
+The code is split into 8 modules concatenated into one IIFE by `build.js`, which writes two outputs:
+- `clicker.js` — paste-into-DevTools bundle (manual fallback).
+- `chrome-ext/iframe-script.js` — extension content script, injected into the game iframe at `document_start`.
 
 ### Module load order (strict dependency chain)
 
 ```
-config.js → capture.js → vision.js → clicker.js → ui.js
+glspy.js → network.js → dbgclick.js → capture.js → scenegraph.js → overlay.js → visit.js → ui.js
 ```
 
-Changing this order will break initialization since later modules reference earlier ones via `window.HC_*`.
+The extension build splits these into two phases: `glspy` / `network` / `dbgclick` / `capture` / `scenegraph` load eagerly at `document_start` (so the WebGL `getContext` hook beats PIXI), and `overlay` / `visit` / `ui` are deferred until `HC_Capture.whenReady()` fires.
 
 ### Module responsibilities
 
-- **config.js** — `HC_CFG` object. All tunable parameters live here. Color targets are HSL ranges (`hMin/hMax/sMin/sMax/lMin/lMax`). Gold target is commented out by default because it matches warm scenery tones (sunflowers, wooden buildings).
-- **capture.js** — `HC_Capture`. Hooks `gl.drawElements()` to capture full-frame pixel data. The game's WebGL context has `preserveDrawingBuffer: false`, so `readPixels()` outside draw calls returns all-black. The hook reads pixels right after each draw call completes, checking the center pixel is non-black before doing a full-frame read (to avoid capturing intermediate passes like shadows).
-- **vision.js** — `HC_Vision`. Stateless functions: `rgbToHsl()`, `scanFrame()`, `samplePixel()`. Scan iterates pixels at `scanStep` intervals, converts to HSL, matches against targets, then clusters nearby hits using a simple O(n^2) distance-based algorithm with `clusterRadius`. Clusters below `minCluster` are discarded.
-- **clicker.js** — `HC_Clicker`. Manages run state and three click modes. Click simulation dispatches `pointerdown → mousedown → pointerup → mouseup → click` events on the canvas with computed client coordinates (accounts for CSS scaling via `getBoundingClientRect`).
-- **ui.js** — `HC_UI`. Creates the fixed-position draggable panel. Reads/writes `HC_CFG` directly for slider values. Calls `HC_Clicker` methods for actions.
+- **glspy.js** — `HC_GLSpy`. Hooks WebGL state changes to fingerprint draw calls and snapshot texture usage. Used for offline scene-graph reverse engineering, not by the live loop.
+- **network.js** — `HC_Net`. Wraps `XMLHttpRequest` to observe `/proto.html` responses. Classifies each response by its 2-byte envelope (`0x50 0x00` = `"P\0"` = action ok, `0x30 0x00` = `"0\0"` = idle tick, anything else = error). Keeps a 32-entry ring of recent (req, resp) byte pairs and exposes `lastFarmObjects()` / `lastFarmLoadSeq()` / `awaitNextFarmLoad()` for callers that need to know "did the game just load a new farm?"
+- **dbgclick.js** — `HC_DbgClick`. Front-end of the debugger-click path. Forwards click coords to the extension's isolated-world script via `postMessage`, which forwards to the background service worker, which dispatches `Input.dispatchMouseEvent` through its `chrome.debugger` session. Synthetic events on the canvas don't work — PIXI's `InteractionManager` ignores untrusted clicks — so the debugger path is the only reliable way to drive the game.
+- **capture.js** — `HC_Capture`. Thin canvas locator. Hooks `HTMLCanvasElement.getContext` so any future module can grab the real WebGL context, but the live loop only uses `HC_Capture.canvas` for `getBoundingClientRect`.
+- **scenegraph.js** — `HC_Scene`. Best-effort PIXI scene graph discovery (`__PIXI_DEVTOOLS_GLOBAL_HOOK__`, canvas back-refs, window globals). Diagnostic-only; no live-loop dependency.
+- **overlay.js** — `HC_Overlay`. Renders parsed farm-load objects onto a transparent canvas overlay, with a tunable world→screen transform (`tw`, `th`, `cx`, `cy`). The default transform is a guess; `HC_Overlay.calibrateFromPairs` lets you fit it from known (world, canvas) coord pairs. **Until calibration runs, projected coords are not trustworthy** — `HC_Visit.sweepMode` defaults to `'grid'` for that reason.
+- **visit.js** — `HC_Visit`. The autonomous loop. Bootstraps into a friend farm via hub probes if needed, runs one full grid pass per farm, then tries the popup `Далее` and bottom-left `Далее` buttons in sequence to advance. Stops after 2 consecutive empty advances (backpack-full proxy).
+- **ui.js** — `HC_UI`. Draggable panel with START/STOP, Sweep Once, Enter Hub Farm, Probe DbgClick, three coord pickers, a live diagnostic line, and a 160px scrollable log box mirroring `HC_Visit.log` lines via `postMessage` to the parent frame.
 
 ## Key Technical Details
 
-### WebGL Frame Capture
+### XHR envelope (HC_Net)
+
+The game communicates with the server via length-prefixed binary `POST /proto.html` calls. The first two bytes of the response classify the outcome:
+
+| Bytes (hex) | ASCII | Meaning |
+|-------------|-------|---------|
+| `50 00`     | `P\0` | Action acknowledged — a click hit a real interactable, state changed. Counts as `totalOk`. |
+| `30 00`     | `0\0` | Background tick / idle poll — no state change. Counts as `totalTick`. |
+| `00 00`     | —     | Error envelope (e.g. "expired request"). Counts as `totalErr`. |
+| anything else | —   | Unknown — logged as `envelope=<char>` for debugging. |
+
+**Caveat**: background terrain tiles also produce `P\0` responses on click. The success oracle therefore can't tell "I collected a resource" from "I clicked grass and the server acknowledged the click" — only "the click reached the game." This is why `maxSweepsPerFarm = 1`: there is no reliable per-cell signal to stop early.
+
+Farm-load responses are large (~67 KB vs ~3 KB for ticks). `HC_Net.lastFarmLoadSeq()` and `awaitNextFarmLoad({ afterSeq })` use `respLen >= 8000` as the discriminator. These functions are the canonical "are we in a farm yet?" / "did clicking Далее actually advance?" oracle.
+
+### Click dispatch (HC_DbgClick)
 
 ```
-gl.drawElements() → origDrawElements() → readPixels(center) → if non-black → readPixels(full frame)
+HC_Visit.click(cx, cy)
+  → HC_DbgClick.click(viewportX, viewportY)            [MAIN world]
+  → postMessage to iframe-isolated.js                  [ISOLATED world]
+  → chrome.runtime.sendMessage to background.js        [service worker]
+  → chrome.debugger Input.dispatchMouseEvent           [Devtools Protocol]
+  → game receives a trusted click
 ```
 
-- Frame data is stored as `Uint8Array(width * height * 4)` in RGBA order
-- WebGL coordinate system has Y=0 at bottom, so screen Y must be flipped: `fy = height - 1 - screenY`
-- Capture is one-shot per request (`captureRequested` flag) to avoid performance impact
-- The hook chains: if the script is re-injected, it hooks the already-hooked function (works fine, just adds a layer)
+Coordinate spaces:
 
-### HSL Color Detection
+| Space | Range | Where |
+|---|---|---|
+| Canvas pixels | 0..1000 × 0..700 | `HC_Visit`, `HC_Overlay` internal coords |
+| Iframe-viewport pixels | varies | What `Input.dispatchMouseEvent` accepts (debugger is attached to the iframe target) |
+| Top-frame viewport pixels | varies | `iframe.getBoundingClientRect().left/top` shift in this space |
 
-RGB → HSL conversion follows the standard algorithm. Detection targets are defined as HSL bounding boxes. Current targets:
+`HC_Visit.click` does the canvas → iframe-viewport translation per click, never caching the rect (the iframe's position shifts when the HC panel expands/collapses).
 
-| Target | H range | S range | L range | Status |
-|--------|---------|---------|---------|--------|
-| purple | 260–320 | 30–100 | 25–70 | Active |
-| gold | 40–50 | 80–100 | 50–70 | Disabled (too broad) |
+### Build System
 
-The purple range covers violet/magenta resource-ready indicators. Gold was disabled because hue 35-55 at moderate saturation matches wooden buildings, sunflowers, hay, and other warm-toned scenery across the entire farm (produced 84 false-positive clusters in testing).
+`build.js` is a Node concatenator producing two outputs:
 
-### Clustering Algorithm
+1. **Paste bundle (`clicker.js`)** — wraps all 8 modules in one IIFE with a canvas check and a cleanup preamble (removes any prior `#hc-panel`, clears `__hcTimer`).
+2. **Extension content script (`chrome-ext/iframe-script.js`)** — same modules, but eager (`glspy`, `network`, `dbgclick`, `capture`, `scenegraph`) load at `document_start` and the rest are wrapped in `HC_Capture.whenReady(...)`. Also appends a `postMessage` bridge (the `HC_CMD` / `HC_RES` switch) so the parent page or external automation can drive the loop programmatically.
 
-Simple single-pass greedy clustering:
-1. For each unvisited hit, start a new cluster
-2. Add all unvisited hits within `clusterRadius` pixels (Euclidean distance)
-3. Cluster center = average of all member positions
-4. Discard clusters with fewer than `minCluster` members
+No transpilation, bundling, or minification. The output is directly paste-able / loadable.
 
-This is O(n^2) but fast enough for ~10k hits at step=3 on a 1000x700 canvas.
+### Re-injection
 
-### Click Simulation
-
-The game uses PIXI's `InteractionManager` which listens for pointer/mouse events on the canvas. Dispatching synthetic events requires:
-- Correct `clientX`/`clientY` (CSS coordinates, not canvas coordinates)
-- Scaling factor: `canvas.width / getBoundingClientRect().width`
-- Full event sequence: `pointerdown → mousedown → pointerup → mouseup → click`
-
-Smart mode adds a +10px Y offset to clicks (`detected.y + 10`) to hit the building body rather than the badge itself.
-
-### Game Environment
-
-- Game engine: PIXI.js v4/5 with WebGL renderer
-- Canvas size: 1000x700 (CSS-scaled to fit viewport)
-- Global objects: `TF` (text formatting), `T` (social sharing), `sender` (network), `getGameContext()` (returns user/session info), `gameFacade` (function, returns null)
-- Game scripts are UUID-named bundles (obfuscated)
-- Cross-origin iframe blocks parent page JS access; script must be injected in the iframe's console context
-
-## Build System
-
-`build.js` is a simple Node.js concatenator:
-1. Reads modules from `src/` in dependency order
-2. Wraps in outer IIFE with canvas check and cleanup
-3. Indents module content
-4. Appends init logging
-5. Writes to `clicker.js`
-
-No transpilation, bundling, or minification. The output is directly paste-able into a browser console.
+Every module is guarded by `if (window.HC_X) { console.log('reusing'); return; }` so re-running the script (during development hot-reload) doesn't re-hook XHR / canvas / `getContext` — it just re-uses the existing instances. The UI panel is removed and recreated.
 
 ## Tuning Guide
 
-If detection produces false positives:
-- Increase `minCluster` (default 15) — larger clusters are more likely to be real badges
-- Narrow HSL ranges in config — use Calibrate to sample actual badge pixels
-- Increase `scanStep` for faster but coarser scans
+If the loop fires clicks but `HC_Net.totalOk` stays at 0:
+- Probe the debugger path: `HC_DbgClick.probe()`. If it reports ok but clicks aren't landing, another `chrome.debugger` session likely stole the attach (e.g. claude-in-chrome MCP). Detach the other session.
+- Confirm you're not in an empty hub view — `HC_Net.lastFarmLoadSeq()` should be non-null.
 
-If detection misses badges:
-- Decrease `minCluster`
-- Widen HSL ranges or add new targets
-- Decrease `scanStep` for finer pixel coverage
+If `enterFarmFromHub` never finds a farm:
+- The hub-probe grid (`HUB_PROBES` in visit.js, x=200–850 step 130, y=220–520 step 100, 24 points) only covers the typical hub layout. A farm icon outside that bounding box won't get hit; widen the grid.
 
-Grid mode bypasses detection entirely and clicks a 12x9 grid pattern every 80ms, pausing 2s between sweeps. Use this as a fallback when color calibration isn't practical.
+If you want parsed-object sweeps instead of grid:
+- Calibrate `HC_Overlay` first via `overlayCalibrate` with two or more known (world, canvas) point pairs.
+- Then `HC_Visit.setSweepMode('auto')` or `'parsed'`.
+
+## See Also
+
+- `doc/05-network-api-discovery.md` — XHR envelope discovery, including the 0x80 → 0x50 hex/decimal fix.
+- `doc/06-farm-state-decoding.md` — the farm-load packet parser (`parseFarmLoad`, type prefixes, position layout).
+- `doc/07-autonomous-visit-loop.md` — the visit loop's working primitive, calibrated coordinates, known issues.
