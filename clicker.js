@@ -1,5 +1,5 @@
 // Hedgehog Clicker (Ёжики) — autonomous friend-farm collector
-// Built: 2026-04-30
+// Built: 2026-05-01
 //
 // HOW TO USE:
 // 1. Open the game at https://vk.com/ezhiky_game
@@ -401,6 +401,7 @@
           const reqAt = Date.now();
           const reqBytes = bodyToBytes(body);
           const reqUrl = this.__hcUrl;
+          const reqMethod = this.__hcMethod || 'POST';
           this.addEventListener('load', () => {
             totalSeen++;
             lastResponseAt = Date.now();
@@ -433,6 +434,7 @@
             else           { totalErr++;  lastErrAt  = lastResponseAt; }
             pushRing({
               url: reqUrl,
+              method: reqMethod,
               reqAt, respAt: lastResponseAt,
               ok, tick, load, http200, envelope,
               reqLen: reqBytes ? reqBytes.length : 0,
@@ -559,17 +561,28 @@
       return false;
     }
   
-    // Cheap "is there a farm-load in the ring, and what's its seq?" — no
-    // packet parsing. opts: { minRespLen: number }. Returns null if none.
-    // Farm-loads carry the server-push envelope ('\x05\x00'), classified as
-    // `load`, NOT the action-ack envelope ('\x50\x00'). Older builds keyed on
-    // `e.ok` and missed every farm-load — be sure to recognize `e.load` too.
+    // Cheap "is there a friend-farm load in the ring, and what's its seq?" —
+    // no packet parsing. opts: { minRespLen, maxRespLen }. Returns null if none.
+    //
+    // Envelope: friend-farm-load is the server-push envelope (`\x05\x00`,
+    // classified as `load`). Older builds keyed on `e.ok` and missed every
+    // farm-load — accept `load || ok`.
+    //
+    // Size: a fresh page load drops a HUGE (~1.77 MB) state-init payload that
+    // is ALSO an `\x05\x00` envelope. It's not a friend-farm; it's the user's
+    // session/hub bundle. If we counted it, the visit loop would skip its
+    // hub-bootstrap and try to sweep the hub view. Cap at maxRespLen (default
+    // 1.5 MB — friend farms observed at ~594 KB) to filter the init out.
     function lastFarmLoadSeq(opts) {
       opts = opts || {};
       const minLen = opts.minRespLen || 8000;
+      const maxLen = opts.maxRespLen || 1500000;
       for (let i = ring.length - 1; i >= 0; i--) {
         const e = ring[i];
-        if ((e.load || e.ok) && e.respLen >= minLen && e.resp) return e.seq;
+        if (!(e.load || e.ok)) continue;
+        if (e.respLen < minLen || e.respLen > maxLen) continue;
+        if (!e.resp) continue;
+        return e.seq;
       }
       return null;
     }
@@ -595,14 +608,15 @@
     // opts: { collectiblesOnly: bool, prefixes: string[], minRespLen: number }
     function lastFarmObjects(opts) {
       opts = opts || {};
-      const minLen = opts.minRespLen || 8000; // farm-load is ~67KB; tick polls ~3KB
+      const minLen = opts.minRespLen || 8000;     // farm-load is ~67–594KB; tick polls ~3KB
+      const maxLen = opts.maxRespLen || 1500000;  // exclude the 1.77 MB init payload (see lastFarmLoadSeq)
       let pick = null;
       for (let i = ring.length - 1; i >= 0; i--) {
         const e = ring[i];
         // Farm-load is the server-push envelope (load=true). Older builds also
         // saw it via the action-ack path on some calls, so accept ok=true too.
         if (!(e.load || e.ok)) continue;
-        if (e.respLen < minLen) continue;
+        if (e.respLen < minLen || e.respLen > maxLen) continue;
         if (!e.resp) continue;
         pick = e; break;
       }
@@ -702,6 +716,226 @@
       };
     }
   
+    // ── Endpoint-debugging helpers ──
+    // The replay path (resend a captured Далее /proto.html POST) keeps failing
+    // with `00 00 00 3d 00 13`. To diagnose we need to see the URL query
+    // params, the body opcode, and what differs between two consecutive
+    // successful Далее requests. These helpers are pure inspection + a
+    // controlled replay tool.
+  
+    function _entryBySeq(s) {
+      for (let i = ring.length - 1; i >= 0; i--) if (ring[i].seq === s) return ring[i];
+      return null;
+    }
+  
+    function _hex(bytes, n) {
+      if (!bytes) return '';
+      const lim = Math.min(bytes.length, n != null ? n : bytes.length);
+      let s = '';
+      for (let i = 0; i < lim; i++) {
+        s += (bytes[i] < 0x10 ? '0' : '') + bytes[i].toString(16);
+        if (i % 2 === 1) s += ' ';
+      }
+      return s.trim();
+    }
+  
+    function _ascii(bytes, n) {
+      if (!bytes) return '';
+      const lim = Math.min(bytes.length, n != null ? n : bytes.length);
+      let s = '';
+      for (let i = 0; i < lim; i++) {
+        const c = bytes[i];
+        s += (c >= 0x20 && c < 0x7f) ? String.fromCharCode(c) : '.';
+      }
+      return s;
+    }
+  
+    function _parseUrl(url) {
+      if (!url) return { path: null, params: {} };
+      const q = url.indexOf('?');
+      const path = q < 0 ? url : url.slice(0, q);
+      const params = {};
+      if (q >= 0) {
+        const tail = url.slice(q + 1);
+        for (const part of tail.split('&')) {
+          const eq = part.indexOf('=');
+          if (eq < 0) params[decodeURIComponent(part)] = '';
+          else params[decodeURIComponent(part.slice(0, eq))] = decodeURIComponent(part.slice(eq + 1));
+        }
+      }
+      return { path, params };
+    }
+  
+    // Pretty-dump one entry. Pass a seq, an entry, or omit for newest.
+    function describe(arg) {
+      let e = null;
+      if (arg == null) e = ring[ring.length - 1];
+      else if (typeof arg === 'number') e = _entryBySeq(arg);
+      else e = arg;
+      if (!e) return null;
+      const u = _parseUrl(e.url);
+      return {
+        seq: e.seq,
+        url: { path: u.path, params: u.params, raw: e.url },
+        env: e.envelope, ok: e.ok, tick: e.tick, load: e.load, http200: e.http200,
+        reqLen: e.reqLen, respLen: e.respLen,
+        reqHex:   _hex(e.req,  Math.min(e.reqLen, 64)),
+        reqAscii: _ascii(e.req, Math.min(e.reqLen, 64)),
+        respHex:  _hex(e.resp, Math.min(e.respLen, 64)),
+        respAscii:_ascii(e.resp, Math.min(e.respLen, 64)),
+        reqAt: e.reqAt, respAt: e.respAt,
+      };
+    }
+  
+    // Filter the ring. opts:
+    //   sinceMs        — only entries within last N ms
+    //   urlContains    — substring match on full URL
+    //   envelope       — 'P' | '0' | '\\x05' | etc
+    //   ok / tick / load / err — booleans (combine via OR)
+    //   reqLenMin / reqLenMax
+    //   respLenMin / respLenMax
+    //   reqStartsWith  — array of bytes the request body must start with
+    // Returns descriptors (no raw bytes) by default; pass withBytes:true for full.
+    function findRequests(opts) {
+      opts = opts || {};
+      const since = opts.sinceMs ? Date.now() - opts.sinceMs : 0;
+      const out = [];
+      for (const e of ring) {
+        if (e.respAt < since) continue;
+        if (opts.urlContains && (!e.url || e.url.indexOf(opts.urlContains) < 0)) continue;
+        if (opts.envelope && e.envelope !== opts.envelope) continue;
+        if (opts.reqLenMin != null && e.reqLen < opts.reqLenMin) continue;
+        if (opts.reqLenMax != null && e.reqLen > opts.reqLenMax) continue;
+        if (opts.respLenMin != null && e.respLen < opts.respLenMin) continue;
+        if (opts.respLenMax != null && e.respLen > opts.respLenMax) continue;
+        // boolean OR set
+        const wantOk = opts.ok, wantTick = opts.tick, wantLoad = opts.load, wantErr = opts.err;
+        if (wantOk != null || wantTick != null || wantLoad != null || wantErr != null) {
+          let any = false;
+          if (wantOk && e.ok) any = true;
+          if (wantTick && e.tick) any = true;
+          if (wantLoad && e.load) any = true;
+          if (wantErr && !e.ok && !e.tick && !e.load) any = true;
+          if (!any) continue;
+        }
+        if (opts.reqStartsWith && e.req) {
+          let match = true;
+          for (let i = 0; i < opts.reqStartsWith.length; i++) {
+            if (e.req[i] !== opts.reqStartsWith[i]) { match = false; break; }
+          }
+          if (!match) continue;
+        }
+        out.push(opts.withBytes ? e : describe(e));
+      }
+      return out;
+    }
+  
+    // Group recent requests by their (envelope, first 4 req bytes) — a quick
+    // way to find rare opcodes (Далее should appear once per farm advance,
+    // collect actions appear constantly, ticks dominate everything else).
+    function summarize(opts) {
+      opts = opts || {};
+      const since = opts.sinceMs ? Date.now() - opts.sinceMs : 0;
+      const buckets = {};
+      for (const e of ring) {
+        if (e.respAt < since) continue;
+        const prefix = e.req && e.req.length >= 4
+          ? _hex(e.req.slice(0, 4))
+          : '(no-body)';
+        const key = (e.envelope || '?') + ' | reqPrefix=' + prefix + ' | reqLen=' + e.reqLen;
+        const b = buckets[key] || (buckets[key] = { count: 0, env: e.envelope, reqLen: e.reqLen, prefix, lastSeq: 0, lastRespLen: 0 });
+        b.count++;
+        if (e.seq > b.lastSeq) { b.lastSeq = e.seq; b.lastRespLen = e.respLen; }
+      }
+      return Object.entries(buckets)
+        .map(([k, v]) => Object.assign({ key: k }, v))
+        .sort((a, b) => a.count - b.count); // rare opcodes first — Далее candidate
+    }
+  
+    // Byte-level diff of two requests' bodies + URL params. Useful to spot
+    // request_id format, monotonic counters, embedded sequence numbers.
+    function diff(seqA, seqB) {
+      const a = _entryBySeq(seqA), b = _entryBySeq(seqB);
+      if (!a || !b) return { error: 'one or both seqs not in ring' };
+      const ua = _parseUrl(a.url), ub = _parseUrl(b.url);
+      const urlDiff = { path: ua.path === ub.path ? null : [ua.path, ub.path], params: {} };
+      const allKeys = new Set([...Object.keys(ua.params), ...Object.keys(ub.params)]);
+      for (const k of allKeys) {
+        if (ua.params[k] !== ub.params[k]) urlDiff.params[k] = [ua.params[k], ub.params[k]];
+      }
+      const bodyDiff = [];
+      const aBody = a.req || [], bBody = b.req || [];
+      const max = Math.max(aBody.length, bBody.length);
+      for (let i = 0; i < max; i++) {
+        if (aBody[i] !== bBody[i]) bodyDiff.push({ off: i, a: aBody[i], b: bBody[i] });
+      }
+      return {
+        seqs: [seqA, seqB],
+        urlDiff,
+        reqLen: [aBody.length, bBody.length],
+        bodyDiff: bodyDiff.slice(0, 64),
+        bodyDiffCount: bodyDiff.length,
+        respLen: [a.respLen, b.respLen],
+        respEnv: [a.envelope, b.envelope],
+      };
+    }
+  
+    // Replay a captured request. opts:
+    //   urlMutate(urlObj) → urlObj  // mutate {path, params, raw}
+    //   bodyMutate(bytes) → bytes   // mutate request body bytes
+    //   responseType: default 'arraybuffer'
+    // Returns a Promise<{status, respLen, respHex, respAscii, envelope, ok, tick, load}>
+    function replay(seq, opts) {
+      opts = opts || {};
+      const e = _entryBySeq(seq);
+      if (!e) return Promise.resolve({ error: 'seq not in ring: ' + seq });
+      if (!e.req) return Promise.resolve({ error: 'no captured req body' });
+      let url = e.url;
+      if (typeof opts.urlMutate === 'function') {
+        const u = _parseUrl(e.url);
+        const mutated = opts.urlMutate({ path: u.path, params: Object.assign({}, u.params), raw: e.url });
+        if (typeof mutated === 'string') {
+          url = mutated;
+        } else if (mutated && mutated.path) {
+          const qs = Object.entries(mutated.params || {}).map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
+          url = mutated.path + (qs ? '?' + qs : '');
+        }
+      }
+      let body = e.req.slice();
+      if (typeof opts.bodyMutate === 'function') {
+        const m = opts.bodyMutate(body);
+        if (Array.isArray(m) || (m && m.length != null)) body = Array.from(m);
+      }
+      const buf = new Uint8Array(body).buffer;
+      return new Promise((resolve) => {
+        const x = new XMLHttpRequest();
+        x.open(e.method || 'POST', url, true);
+        x.responseType = opts.responseType || 'arraybuffer';
+        x.onload = function() {
+          let respBytes = null;
+          try { respBytes = x.response instanceof ArrayBuffer ? Array.from(new Uint8Array(x.response)) : null; } catch(_) {}
+          let envelope = null, ok = false, tick = false, load = false;
+          if (respBytes && respBytes.length >= 2 && respBytes[1] === 0x00) {
+            if (respBytes[0] === 0x50)      { ok = true;   envelope = 'P'; }
+            else if (respBytes[0] === 0x30) { tick = true; envelope = '0'; }
+            else if (respBytes[0] === 0x05) { load = true; envelope = '\\x05'; }
+            else                            { envelope = String.fromCharCode(respBytes[0]); }
+          }
+          resolve({
+            status: x.status,
+            respLen: respBytes ? respBytes.length : 0,
+            respHex:  respBytes ? _hex(respBytes, Math.min(respBytes.length, 64)) : '',
+            respAscii: respBytes ? _ascii(respBytes, Math.min(respBytes.length, 64)) : '',
+            envelope, ok, tick, load,
+            urlSent: url,
+            bodyLenSent: body.length,
+          });
+        };
+        x.onerror = function() { resolve({ error: 'xhr error', status: x.status }); };
+        x.send(buf);
+      });
+    }
+  
     return {
       awaitNextResponse,
       getStats() {
@@ -716,6 +950,12 @@
       lastFarmLoadSeq,
       awaitNextFarmLoad,
       isCollectible,
+      // Endpoint-debugging surface
+      describe,
+      findRequests,
+      summarize,
+      diff,
+      replay,
       // Cheap "did anything succeed in the last N ms?" — useful for a passive
       // sanity check after a known game action.
       wasRecentSuccess(sinceMs) { return Date.now() - lastOkAt < sinceMs; },
@@ -1329,7 +1569,11 @@
     const BTN = {
       home:     { x: 80,  y: 660 }, // "Выйти" — bottom-left, returns from friend farm
       next:     { x: 200, y: 660 }, // "Далее" — bottom-left, appears once farm is exhausted
-      popupNext:{ x: 500, y: 310 }, // "Далее" inside the centered "nothing more to do" popup
+      popupNext:{ x: 476, y: 369 }, // "Далее" inside the centered "nothing more to do" popup
+                                    // (re-calibrated 2026-05-01 via the panel picker;
+                                    // the old (500, 310) was a guess and missed by ~60 px,
+                                    // which left the popup up and silently blocked
+                                    // BTN.next clicks too. See doc 07.)
       voyage:   { x: 765, y: 260 }, // "В путь!" on TRAVELS_HUB
       travels:  { x: 0,   y: 0   }, // "Путешествия" on main farm — TBD
       sessionEndOk: { x: 0, y: 0 }, // confirm on "backpack full" dialog — TBD
@@ -1354,7 +1598,7 @@
       minOkPerSweep:    3,     // unused when maxSweepsPerFarm=1, kept for manual override
       hubProbeGap:      400,   // ms between hub farm-icon probe clicks
       hubProbeTimeout:  1500,  // ms to await a farm-load XHR after each probe
-      maxHubAttempts:   24,    // bound probes per enterFromHub call
+      maxHubAttempts:   32,    // bound probes per enterFromHub call (HUB_PROBES = 4 confirmed + 25 grid = 29)
       stopAfterEmptyAdvances: 2, // backpack-full proxy: stop after N advances that produce no new farm-load
       // 'auto' = use parsed list when HC_Net has decoded objects AND the
       // projected coords land inside the canvas; else fall back to grid.
@@ -1511,11 +1755,21 @@
     }
   
     // ── Hub entry: probe known farm-icon positions until one loads a farm ──
-    // Coarse grid covering the hub playfield; hub farm icons are usually
-    // ~80–120 px wide so a ~150 px grid usually hits at least one.
-    const HUB_PROBES = [];
-    for (let y = 220; y <= 520; y += 100) {
-      for (let x = 200; x <= 850; x += 130) HUB_PROBES.push({ x, y });
+    // The friends-hub renders friend-farm icons inside a central panel, not
+    // across the full playfield. The original 24-point wide grid (x 200–850
+    // step 130, y 220–520 step 100) missed every icon in the user's actual
+    // layout — calibrated 2026-05-01 via the panel picker.
+    // Strategy: try four user-confirmed icon coords first (almost certainly
+    // hits one), then a tight 5×5 grid around the cluster as a fallback.
+    const HUB_PROBES = [
+      // Confirmed friend-icon positions (panel-picker calibration, 2026-05-01)
+      { x: 408, y: 233 },
+      { x: 529, y: 305 },
+      { x: 544, y: 414 },
+      { x: 512, y: 445 },
+    ];
+    for (let y = 220; y <= 460; y += 60) {
+      for (let x = 380; x <= 580; x += 50) HUB_PROBES.push({ x, y });
     }
   
     async function enterFarmFromHub(opts) {
@@ -1564,16 +1818,18 @@
         stats.passes++;
         log('sweep done: ok=' + r.ok + ' items=' + r.resourceItems + ' (resp ' + r.withResources + '/' + r.ackCount + ') totalAttempts=' + stats.attempts + ' clickFails=' + clickFails);
   
-        // Server-side signal: if EVERY P\0 ack we got back included no ra_*
-        // resource record, the backpack is full (or the farm has nothing left
-        // to give). Two such sweeps in a row → stop. This is the byte-level
-        // signal the previous version was lacking; it's far more decisive
-        // than the empty-advance counter.
+        // Items in the response = resources DROPPED INTO PLAYER STORAGE
+        // (shared across farms, capped by inventory free-space). NOT a
+        // signal that the current farm has more loot.
+        // If r.ackCount > 0 but r.withResources === 0, every click was a
+        // "you got nothing" ack — the inventory cap is hit (or, less likely,
+        // we somehow sweeped only terrain). Backpack-full is the dominant
+        // cause; stop after 2 such sweeps in a row.
         if (r.ackCount > 0 && r.withResources === 0) {
           zeroCollectSweeps++;
-          log('zero-resource sweep #' + zeroCollectSweeps + ' (acks=' + r.ackCount + ', items=0) — likely backpack full or farm exhausted');
+          log('zero-resource sweep #' + zeroCollectSweeps + ' (acks=' + r.ackCount + ', items=0) — likely backpack full');
           if (zeroCollectSweeps >= 2) {
-            log('STOP: 2 consecutive sweeps with no ra_* collected — backpack likely full');
+            log('STOP: 2 consecutive sweeps with no ra_* collected — backpack full');
             running = false;
             return;
           }
@@ -1610,15 +1866,21 @@
     }
   
     // Click each candidate Далее position in order, awaiting a farm-load XHR
-    // after each. Returns true on the first that produces one. Candidates:
-    //   1. Popup-center "Далее" (canvas ~497, 380) — appears only when farm
-    //      is fully exhausted; bottom-left button is disabled while popup is up.
-    //   2. Bottom-left Далее (BTN.next, default 200, 660) — present after any
-    //      collection.
+    // after each. Returns true on the first that produces one.
+    //
+    // The Далее popup ("Здесь нам делать больше нечего, отправляемся дальше!")
+    // is rendered AT THE PLAYER CHARACTER'S WORLD POSITION, which changes per
+    // farm. So a fixed coord misses on most farms. Strategy:
+    //   1. Try BTN.popupNext (cached from last picker / successful advance).
+    //   2. Try BTN.next (bottom-left button — exists on some layouts).
+    //   3. Probe-scan a small grid covering the canvas's central ~half where
+    //      the popup almost always lands. First click that produces a
+    //      farm-load XHR wins.
+    // The scan adds ~2–10s in the worst case, vs failing the advance entirely.
     async function tryAdvance(seqBefore) {
       const candidates = [
-        { name: 'popup-Далее', x: BTN.popupNext.x, y: BTN.popupNext.y },
-        { name: 'btn-Далее',   x: BTN.next.x, y: BTN.next.y },
+        { name: 'popup-Далее (cached)', x: BTN.popupNext.x, y: BTN.popupNext.y },
+        { name: 'btn-Далее',            x: BTN.next.x,      y: BTN.next.y      },
       ];
       for (const c of candidates) {
         if (!running) return false;
@@ -1627,11 +1889,31 @@
         const newSeq = await net.awaitNextFarmLoad({ afterSeq: seqBefore, timeoutMs: VCFG.advanceWait });
         if (newSeq != null && newSeq !== seqBefore) {
           log('advance OK via ' + c.name + ' → seq=' + newSeq);
-          await sleep(600); // settle in new farm
+          await sleep(600);
           return true;
         }
         log('  ' + c.name + ' produced no farm-load');
       }
+  
+      // Fallback popup-hunt: dense probe in the central canvas area where the
+      // popup is rendered. On a hit, cache the coord so the next farm gets the
+      // fast path.
+      log('popup-hunt: scanning central canvas for Далее button…');
+      for (let y = 200; y <= 470; y += 35) {
+        for (let x = 280; x <= 720; x += 35) {
+          if (!running) return false;
+          click(x, y);
+          const newSeq = await net.awaitNextFarmLoad({ afterSeq: seqBefore, timeoutMs: 350 });
+          if (newSeq != null && newSeq !== seqBefore) {
+            BTN.popupNext.x = x;
+            BTN.popupNext.y = y;
+            log('popup-hunt HIT @ (' + x + ',' + y + ') → seq=' + newSeq + ' — cached as BTN.popupNext');
+            await sleep(600);
+            return true;
+          }
+        }
+      }
+      log('popup-hunt exhausted — no advance found');
       return false;
     }
   
@@ -1677,6 +1959,406 @@
       getLog() { return logBuf.slice(); },
       clearLog() { logBuf.length = 0; },
       getClickCounters() { return { clicks: clickCount, fails: clickFails }; },
+    };
+  })();
+  }
+  
+
+  // ═══ headless.js ═══
+  // ── HC_Headless: pure-XHR friend-farm cycle, no canvas clicks ──
+  //
+  // Drives the entire travel cycle (own-farm → travel-prep → friends-hub →
+  // farm[0..N] → own-farm) by fabricating /proto.html POSTs directly. No
+  // dependency on HC_DbgClick, no need for the game tab to be foregrounded.
+  //
+  // Server endpoints used (see doc/08-network-replay-and-protocol.md):
+  //   5000 073d  — В путь (start travel cycle, fetch friend list)
+  //   0500 013d  — enter friend farm
+  //   5000 033d  — collect single object (eid + type known from farm-load)
+  //   5000 093d  — Далее (advance to next friend)
+  //
+  // Per-click hash is server-side IGNORED → we forge a random hex string.
+  // request_id second-part must be monotonically increasing per-session →
+  // we use Date.now() suffix.
+  //
+  // Trade-off vs the click-based loop: the game's PIXI client can't tell
+  // these requests happened, so the canvas UI desyncs from server state.
+  // That's fine for headless operation; if you want a synced UI, reload.
+  
+  if (window.HC_Headless) {
+    console.log('[HC] Headless already installed — reusing.');
+  } else {
+  window.HC_Headless = (function() {
+    const N = window.HC_Net;
+    if (!N) { console.error('[HC_Headless] HC_Net missing — cannot install.'); return null; }
+  
+    // ── log buffer (shared with HC_Visit-style UI) ──
+    const logBuf = [];
+    function log(msg) {
+      const ts = new Date().toISOString().slice(11, 19);
+      const line = '[' + ts + '] ' + msg;
+      logBuf.push(line);
+      if (logBuf.length > 200) logBuf.shift();
+      console.log('[HC_Headless]', msg);
+      try { window.parent.postMessage({ type: 'HC_LOG', line: '[HC_Headless] ' + msg }, '*'); } catch (e) {}
+    }
+  
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  
+    // ── request_id generator: monotonic per-session ──
+    // Format <7d random>.<integer>. The second part must be ≥ the highest
+    // the server has seen this session, so we anchor to Date.now() ms.
+    function freshReqId() {
+      return Math.floor(Math.random() * 9e6 + 1e6) + '.' + (Date.now() % 100000000);
+    }
+  
+    // ── pick the most recent /proto.html template to copy URL skeleton ──
+    // We need a real recent /proto.html capture for: sid, host, path, base
+    // params. Without one we can't fabricate URLs.
+    function latestProtoTemplate() {
+      const all = N.findRequests({ sinceMs: 3600000, withBytes: true });
+      return all.length ? all[all.length - 1] : null;
+    }
+  
+    // ── Direct send: build URL from a template + body bytes, return parsed response ──
+    function send(opcodeBytes, bodyBytes, opts) {
+      opts = opts || {};
+      const tmpl = latestProtoTemplate();
+      if (!tmpl) return Promise.resolve({ error: 'no /proto.html template in ring — fire any in-game action once first' });
+      return N.replay(tmpl.seq, {
+        urlMutate(u) {
+          u.params.proto = opts.proto || u.params.proto;
+          u.params.request_id = freshReqId();
+          return u;
+        },
+        bodyMutate() { return bodyBytes; },
+      });
+    }
+  
+    // ── Body builders ──
+    function buildVoyage(friendIdHex32) {
+      // 50 00 07 3d  00 00 00 00 00  <32 ASCII hex>
+      const out = [0x50, 0x00, 0x07, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x00];
+      for (let i = 0; i < 32; i++) out.push(friendIdHex32.charCodeAt(i));
+      return out;
+    }
+  
+    // Enter-farm body — when possible, copy bytes from a captured template
+    // and only swap the trailing 32-char friend ID. Avoids any byte-ordering
+    // drift between game versions. Falls back to a synthesized body that
+    // matches the format observed in this session's captures:
+    //   05 00 01 3d  00 03 00 00 00  01 00 00  <32 ASCII hex>
+    function buildEnterFarm(friendIdHex32) {
+      const tpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x05, 0x00, 0x01, 0x3d] }).slice(-1)[0];
+      if (tpl && tpl.req && tpl.req.length === 44) {
+        const out = tpl.req.slice();
+        for (let i = 0; i < 32; i++) out[12 + i] = friendIdHex32.charCodeAt(i);
+        return out;
+      }
+      // synthesized fallback — header is 12 bytes, friend id is 32 bytes
+      const out = [0x05, 0x00, 0x01, 0x3d, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+      for (let i = 0; i < 32; i++) out.push(friendIdHex32.charCodeAt(i));
+      return out;
+    }
+  
+    function buildDalee(friendIdHex32) {
+      // Prefer copying captured Далее template (same trick as buildEnterFarm).
+      const tpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x50, 0x00, 0x09, 0x3d] }).slice(-1)[0];
+      if (tpl && tpl.req && tpl.req.length === 41) {
+        const out = tpl.req.slice();
+        for (let i = 0; i < 32; i++) out[9 + i] = friendIdHex32.charCodeAt(i);
+        return out;
+      }
+      const out = [0x50, 0x00, 0x09, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x00];
+      for (let i = 0; i < 32; i++) out.push(friendIdHex32.charCodeAt(i));
+      return out;
+    }
+  
+    // 50 00 03 3d  00 <contentLen-uint8> 00 00 00
+    // 24 00 <36-char UUID with dashes>
+    // <typeCode-uint8> <eid-uint32-LE> <typeNameLen-uint16-LE> <ASCII type>
+    // 01 00 00 00 <32-char ASCII hex (random — server-ignored)>
+    function buildCollect(friendUuidWithDashes, typeCode, eid, typeName) {
+      const out = [0x50, 0x00, 0x03, 0x3d, 0x00];
+      // content-len placeholder at out[5] — patched at end
+      out.push(0x00); // placeholder
+      out.push(0x00, 0x00, 0x00);
+      out.push(0x24, 0x00);
+      if (friendUuidWithDashes.length !== 36) throw new Error('uuid must be 36 chars: ' + friendUuidWithDashes);
+      for (let i = 0; i < 36; i++) out.push(friendUuidWithDashes.charCodeAt(i));
+      out.push(typeCode & 0xff);
+      out.push(eid & 0xff, (eid >>> 8) & 0xff, (eid >>> 16) & 0xff, (eid >>> 24) & 0xff);
+      out.push(typeName.length & 0xff, (typeName.length >>> 8) & 0xff);
+      for (let i = 0; i < typeName.length; i++) out.push(typeName.charCodeAt(i));
+      out.push(0x01, 0x00, 0x00, 0x00);
+      // random 32-char ASCII hex hash (server ignores)
+      const hex = '0123456789abcdef';
+      for (let i = 0; i < 32; i++) out.push(hex.charCodeAt((Math.random() * 16) | 0));
+      // Patch content-len: total - 41 (header bytes)
+      out[5] = (out.length - 41) & 0xff;
+      return out;
+    }
+  
+    // ── Type-prefix → typeCode mapping (collect request byte 47) ──
+    // Observed: 01=sb_, 02=ga_, 03=te_. Others TBD; extend as needed.
+    function typeCodeFor(typeName) {
+      const pfx = typeName.slice(0, 3);
+      return TYPE_PREFIX_CODE[pfx] || 0x00;
+    }
+  
+    // ── Parsers ──
+  
+    // Parse the friend list from a captured В путь (5000 073d) response.
+    // Each friend record begins with `24 00` followed by a 36-char ASCII UUID.
+    function parseVoyageResp(bytes) {
+      if (!bytes) return [];
+      const friends = [];
+      for (let i = 0; i + 38 <= bytes.length; i++) {
+        if (bytes[i] !== 0x24 || bytes[i + 1] !== 0x00) continue;
+        let ok = true, s = '';
+        for (let j = 0; j < 36; j++) {
+          const c = bytes[i + 2 + j];
+          if (j === 8 || j === 13 || j === 18 || j === 23) { if (c !== 0x2d) { ok = false; break; } }
+          else if (!((c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66))) { ok = false; break; }
+          s += String.fromCharCode(c);
+        }
+        if (ok) {
+          friends.push({ uuid: s, hex32: s.replace(/-/g, '') });
+          i += 37;
+        }
+      }
+      return friends;
+    }
+  
+    // Parse a friend-farm load. Records are anchored on type-name strings
+    // that start with a known prefix (ga_/te_/sb_/fl_/pl_/ra_/dc_/tl_/bl_).
+    // For each match we walk back 14 bytes to read:
+    //   [uint32 LE eid][uint32 LE field1][uint32 LE field2][uint16 LE typeLen]
+    // This works across both farm-load formats observed (with delimiter
+    // `06 7d da 41 00` AND without it). Reading backward is cheap because
+    // type prefixes are rare.
+    // Prefixes that PARSE — used by parseFarmLoadV2 to anchor records.
+    // (Includes scenery so the whole record list is parsed for diagnostics.)
+    const KNOWN_PREFIXES = ['ga_', 'te_', 'sb_', 'fl_', 'pl_', 'ra_', 'dc_', 'tl_', 'bl_', 'fe_', 'pi_'];
+    // Prefixes that are actually COLLECTIBLE on a friend's farm.
+    // Per doc 06: te_/sb_/pl_/pi_/fl_. Subset of ga_ subtypes (wild_onion, tree)
+    // were observed collectible too — we keep ga_ only when it matches a known
+    // collectible-subtype regex; otherwise scenery (ga_grass3, ga_birch3, ...)
+    // produces the "FriendAction: does not have available actions" error.
+    const COLLECTIBLE_PREFIXES = ['te_', 'sb_', 'pl_', 'pi_', 'fl_'];
+    const COLLECTIBLE_GA_RE = /^ga_(wild_|tree$|wild_onion)/;
+    function isCollectibleType(typeName) {
+      const pfx = typeName.slice(0, 3);
+      if (COLLECTIBLE_PREFIXES.indexOf(pfx) >= 0) return true;
+      if (pfx === 'ga_' && COLLECTIBLE_GA_RE.test(typeName)) return true;
+      return false;
+    }
+    // Type-prefix code for collect requests (byte 47 of 5000 033d body).
+    // Verified: 01=sb_, 02=ga_, 03=te_. Others empirically guessed.
+    const TYPE_PREFIX_CODE = { sb_: 0x01, ga_: 0x02, te_: 0x03, pl_: 0x04, fl_: 0x05, pi_: 0x06 };
+  
+    function parseFarmLoadV2(bytes) {
+      if (!bytes) return [];
+      const out = [];
+      const seen = new Set();
+      const N_ = bytes.length;
+      for (let i = 14; i < N_ - 4; i++) {
+        // Look for length-prefixed type-name: <uint16 typeLen> <prefix>
+        if (bytes[i] === 0 || bytes[i] > 32) continue; // typeLen 1..32
+        if (bytes[i + 1] !== 0) continue;
+        const typeLen = bytes[i];
+        if (i + 2 + typeLen > N_) continue;
+        // Check prefix: byte[i+2..i+4] is "xx_"
+        if (bytes[i + 4] !== 0x5f) continue;
+        const c0 = bytes[i + 2], c1 = bytes[i + 3];
+        if (c0 < 0x61 || c0 > 0x7a || c1 < 0x61 || c1 > 0x7a) continue;
+        const prefix = String.fromCharCode(c0) + String.fromCharCode(c1) + '_';
+        if (KNOWN_PREFIXES.indexOf(prefix) < 0) continue;
+        // Read full type-name and ensure all printable
+        let type = '', okType = true;
+        for (let j = 0; j < typeLen; j++) {
+          const c = bytes[i + 2 + j];
+          if (c < 0x20 || c > 0x7e) { okType = false; break; }
+          type += String.fromCharCode(c);
+        }
+        if (!okType) continue;
+        // Walk back 14 bytes to read eid + field1 + field2 (+ typeLen at i)
+        const p = i - 14;
+        if (p < 0) continue;
+        const eid    = bytes[p] | (bytes[p+1] << 8) | (bytes[p+2] << 16) | (bytes[p+3] << 24);
+        const field1 = bytes[p+4] | (bytes[p+5] << 8) | (bytes[p+6] << 16) | (bytes[p+7] << 24);
+        const field2 = bytes[p+8] | (bytes[p+9] << 8) | (bytes[p+10] << 16) | (bytes[p+11] << 24);
+        // Sanity: eid must be a non-zero positive uint32 < ~10M
+        if (eid === 0 || eid > 10_000_000) continue;
+        if (seen.has(eid)) continue;
+        seen.add(eid);
+        out.push({ eid: eid >>> 0, field1: field1 | 0, field2: field2 | 0, type, prefix, off: i });
+        i = i + 2 + typeLen - 1;
+      }
+      return out;
+    }
+  
+    // ── High-level operations ──
+  
+    async function fetchFriendList() {
+      // Look for a cached В путь response in the ring; if none, fire one.
+      let voyage = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x50, 0x00, 0x07, 0x3d] }).slice(-1)[0];
+      if (!voyage || !voyage.resp) {
+        log('no В путь in ring — fabricating one');
+        // Need ANY 32-char hex friend ID for the body — try latest 0500 013d or use placeholder
+        const enterTpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x05, 0x00, 0x01, 0x3d] }).slice(-1)[0];
+        let placeholderId = '00000000000000000000000000000000';
+        if (enterTpl) {
+          const tail = enterTpl.req.slice(enterTpl.req.length - 32);
+          placeholderId = String.fromCharCode.apply(null, tail);
+        }
+        const r = await send([0x50, 0x00, 0x07, 0x3d], buildVoyage(placeholderId), { proto: '50x7' });
+        log('В путь fired: env=' + r.envelope + ' respLen=' + r.respLen);
+        // Wait briefly for the captured XHR to land in ring then re-fetch
+        await sleep(300);
+        voyage = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x50, 0x00, 0x07, 0x3d] }).slice(-1)[0];
+        if (!voyage) return { error: 'В путь fired but response not captured' };
+      }
+      const friends = parseVoyageResp(voyage.resp);
+      log('parsed ' + friends.length + ' friends from В путь response');
+      return { friends, voyageSeq: voyage.seq };
+    }
+  
+    // Pull the captured response bytes out of the ring (replay() only returns
+    // a summary, the bytes are stored on the ring entry by the XHR observer).
+    function lastRingResp(envelope, sinceMs) {
+      const recent = N.findRequests({ sinceMs: sinceMs || 3000, withBytes: true });
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const e = recent[i];
+        if (envelope && e.env !== envelope) continue;
+        if (e.resp) return e;
+      }
+      return null;
+    }
+  
+    async function enterFriendFarm(friendHex32) {
+      log('entering friend ' + friendHex32.slice(0, 8) + '…');
+      const r = await send([0x05, 0x00, 0x01, 0x3d], buildEnterFarm(friendHex32), { proto: '5x1' });
+      log('  enter result: env=' + r.envelope + ' ok=' + r.ok + ' load=' + r.load + ' respLen=' + r.respLen);
+      await sleep(300);
+      // The replay's response landed in the ring as the most recent entry.
+      // We want either a \x05 farm-load, OR the larger of the two acks
+      // (sometimes the farm bytes come back in the P\0 ack).
+      const recent = N.findRequests({ sinceMs: 5000, withBytes: true });
+      let farmLoad = null;
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const e = recent[i];
+        if (e.respLen >= 5000) { farmLoad = e; break; }
+      }
+      return { result: r, farmLoad };
+    }
+  
+    async function collectAll(friendUuidWithDashes, farmLoadBytes, opts) {
+      opts = opts || {};
+      const interMs = opts.interMs != null ? opts.interMs : 80;
+      const stopOnConsecErrors = opts.stopOnConsecErrors != null ? opts.stopOnConsecErrors : 5;
+      const objs = parseFarmLoadV2(farmLoadBytes);
+      const collectibles = objs.filter(o => isCollectibleType(o.type));
+      // Type histogram for diagnostics
+      const typeHist = {};
+      for (const o of collectibles) typeHist[o.type] = (typeHist[o.type] || 0) + 1;
+      log('  parsed ' + objs.length + ' total / ' + collectibles.length + ' collectibles: ' +
+          Object.entries(typeHist).map(([k, v]) => k + ':' + v).join(' '));
+      let tried = 0, acks = 0, errs = 0, consecErr = 0, quotaHit = false;
+      for (const o of collectibles) {
+        if (!running) break;
+        const tc = typeCodeFor(o.type);
+        if (tc === 0x00) continue;
+        const r = await send([0x50, 0x00, 0x03, 0x3d], buildCollect(friendUuidWithDashes, tc, o.eid, o.type), { proto: '50x3' });
+        tried++;
+        if (r.ok) { acks++; consecErr = 0; }
+        else {
+          errs++;
+          consecErr++;
+          // The response ASCII often includes the error reason; read it from the ring.
+          if (errs <= 2 || consecErr === stopOnConsecErrors) {
+            const last = N.findRequests({ sinceMs: 5000, withBytes: true }).slice(-1)[0];
+            const reason = last && last.resp ? Array.from(last.resp).slice(0, 80).map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : '.').join('') : '';
+            log('    err #' + errs + ': ' + reason);
+            if (reason.indexOf('does not have availible actions') >= 0 ||
+                reason.indexOf('does not have available actions') >= 0) {
+              quotaHit = true;
+            }
+          }
+          if (consecErr >= stopOnConsecErrors) {
+            log('  stopping collect: ' + consecErr + ' consecutive errors' + (quotaHit ? ' (friend quota hit)' : ''));
+            break;
+          }
+        }
+        await sleep(interMs);
+      }
+      log('  collect pass: tried=' + tried + ' ok=' + acks + ' err=' + errs + (quotaHit ? ' QUOTA' : ''));
+      return { tried, acks, errs, quotaHit };
+    }
+  
+    async function dalee(nextFriendHex32) {
+      log('Далее → ' + nextFriendHex32.slice(0, 8) + '…');
+      const r = await send([0x50, 0x00, 0x09, 0x3d], buildDalee(nextFriendHex32), { proto: '50x9' });
+      log('  Далее result: env=' + r.envelope + ' ok=' + r.ok + ' respLen=' + r.respLen);
+      await sleep(300);
+      const recent = N.findRequests({ sinceMs: 5000, withBytes: true });
+      let farmLoad = null;
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const e = recent[i];
+        if (e.respLen >= 5000) { farmLoad = e; break; }
+      }
+      return { result: r, farmLoad };
+    }
+  
+    // ── Full cycle ──
+    let running = false;
+  
+    async function runCycle(opts) {
+      opts = opts || {};
+      if (running) { log('runCycle ignored — already running'); return; }
+      running = true;
+      try {
+        log('=== headless cycle START ===');
+        const fl = await fetchFriendList();
+        if (!fl.friends || fl.friends.length === 0) { log('STOP — no friends'); return; }
+        const max = opts.maxFriends || Math.min(fl.friends.length, 5);
+        log('cycle plan: ' + max + ' friends');
+        for (let i = 0; i < max; i++) {
+          if (!running) { log('aborted'); break; }
+          const f = fl.friends[i];
+          log('— friend ' + (i + 1) + '/' + max + ' uuid=' + f.uuid);
+          const enter = await enterFriendFarm(f.hex32);
+          if (!enter.farmLoad) { log('  no farm-load captured; skipping collect'); }
+          else { await collectAll(f.uuid, enter.farmLoad.resp, opts); }
+          if (i + 1 < max) {
+            await dalee(fl.friends[i + 1].hex32);
+          }
+        }
+        log('=== headless cycle END ===');
+      } catch (e) {
+        log('CRASH: ' + (e && e.stack || e));
+      } finally {
+        running = false;
+      }
+    }
+  
+    function stop() { running = false; log('stop requested'); }
+    function isRunning() { return running; }
+  
+    return {
+      runCycle, stop, isRunning,
+      // helpers exposed for debugging / panel use
+      fetchFriendList,
+      enterFriendFarm,
+      dalee,
+      collectAll,
+      parseVoyageResp,
+      parseFarmLoadV2,
+      buildVoyage, buildEnterFarm, buildDalee, buildCollect,
+      typeCodeFor,
+      freshReqId,
+      getLog() { return logBuf.slice(); },
+      clearLog() { logBuf.length = 0; },
     };
   })();
   }

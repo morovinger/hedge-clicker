@@ -59,6 +59,7 @@ window.HC_Net = (function() {
         const reqAt = Date.now();
         const reqBytes = bodyToBytes(body);
         const reqUrl = this.__hcUrl;
+        const reqMethod = this.__hcMethod || 'POST';
         this.addEventListener('load', () => {
           totalSeen++;
           lastResponseAt = Date.now();
@@ -91,6 +92,7 @@ window.HC_Net = (function() {
           else           { totalErr++;  lastErrAt  = lastResponseAt; }
           pushRing({
             url: reqUrl,
+            method: reqMethod,
             reqAt, respAt: lastResponseAt,
             ok, tick, load, http200, envelope,
             reqLen: reqBytes ? reqBytes.length : 0,
@@ -217,17 +219,28 @@ window.HC_Net = (function() {
     return false;
   }
 
-  // Cheap "is there a farm-load in the ring, and what's its seq?" — no
-  // packet parsing. opts: { minRespLen: number }. Returns null if none.
-  // Farm-loads carry the server-push envelope ('\x05\x00'), classified as
-  // `load`, NOT the action-ack envelope ('\x50\x00'). Older builds keyed on
-  // `e.ok` and missed every farm-load — be sure to recognize `e.load` too.
+  // Cheap "is there a friend-farm load in the ring, and what's its seq?" —
+  // no packet parsing. opts: { minRespLen, maxRespLen }. Returns null if none.
+  //
+  // Envelope: friend-farm-load is the server-push envelope (`\x05\x00`,
+  // classified as `load`). Older builds keyed on `e.ok` and missed every
+  // farm-load — accept `load || ok`.
+  //
+  // Size: a fresh page load drops a HUGE (~1.77 MB) state-init payload that
+  // is ALSO an `\x05\x00` envelope. It's not a friend-farm; it's the user's
+  // session/hub bundle. If we counted it, the visit loop would skip its
+  // hub-bootstrap and try to sweep the hub view. Cap at maxRespLen (default
+  // 1.5 MB — friend farms observed at ~594 KB) to filter the init out.
   function lastFarmLoadSeq(opts) {
     opts = opts || {};
     const minLen = opts.minRespLen || 8000;
+    const maxLen = opts.maxRespLen || 1500000;
     for (let i = ring.length - 1; i >= 0; i--) {
       const e = ring[i];
-      if ((e.load || e.ok) && e.respLen >= minLen && e.resp) return e.seq;
+      if (!(e.load || e.ok)) continue;
+      if (e.respLen < minLen || e.respLen > maxLen) continue;
+      if (!e.resp) continue;
+      return e.seq;
     }
     return null;
   }
@@ -253,14 +266,15 @@ window.HC_Net = (function() {
   // opts: { collectiblesOnly: bool, prefixes: string[], minRespLen: number }
   function lastFarmObjects(opts) {
     opts = opts || {};
-    const minLen = opts.minRespLen || 8000; // farm-load is ~67KB; tick polls ~3KB
+    const minLen = opts.minRespLen || 8000;     // farm-load is ~67–594KB; tick polls ~3KB
+    const maxLen = opts.maxRespLen || 1500000;  // exclude the 1.77 MB init payload (see lastFarmLoadSeq)
     let pick = null;
     for (let i = ring.length - 1; i >= 0; i--) {
       const e = ring[i];
       // Farm-load is the server-push envelope (load=true). Older builds also
       // saw it via the action-ack path on some calls, so accept ok=true too.
       if (!(e.load || e.ok)) continue;
-      if (e.respLen < minLen) continue;
+      if (e.respLen < minLen || e.respLen > maxLen) continue;
       if (!e.resp) continue;
       pick = e; break;
     }
@@ -360,6 +374,226 @@ window.HC_Net = (function() {
     };
   }
 
+  // ── Endpoint-debugging helpers ──
+  // The replay path (resend a captured Далее /proto.html POST) keeps failing
+  // with `00 00 00 3d 00 13`. To diagnose we need to see the URL query
+  // params, the body opcode, and what differs between two consecutive
+  // successful Далее requests. These helpers are pure inspection + a
+  // controlled replay tool.
+
+  function _entryBySeq(s) {
+    for (let i = ring.length - 1; i >= 0; i--) if (ring[i].seq === s) return ring[i];
+    return null;
+  }
+
+  function _hex(bytes, n) {
+    if (!bytes) return '';
+    const lim = Math.min(bytes.length, n != null ? n : bytes.length);
+    let s = '';
+    for (let i = 0; i < lim; i++) {
+      s += (bytes[i] < 0x10 ? '0' : '') + bytes[i].toString(16);
+      if (i % 2 === 1) s += ' ';
+    }
+    return s.trim();
+  }
+
+  function _ascii(bytes, n) {
+    if (!bytes) return '';
+    const lim = Math.min(bytes.length, n != null ? n : bytes.length);
+    let s = '';
+    for (let i = 0; i < lim; i++) {
+      const c = bytes[i];
+      s += (c >= 0x20 && c < 0x7f) ? String.fromCharCode(c) : '.';
+    }
+    return s;
+  }
+
+  function _parseUrl(url) {
+    if (!url) return { path: null, params: {} };
+    const q = url.indexOf('?');
+    const path = q < 0 ? url : url.slice(0, q);
+    const params = {};
+    if (q >= 0) {
+      const tail = url.slice(q + 1);
+      for (const part of tail.split('&')) {
+        const eq = part.indexOf('=');
+        if (eq < 0) params[decodeURIComponent(part)] = '';
+        else params[decodeURIComponent(part.slice(0, eq))] = decodeURIComponent(part.slice(eq + 1));
+      }
+    }
+    return { path, params };
+  }
+
+  // Pretty-dump one entry. Pass a seq, an entry, or omit for newest.
+  function describe(arg) {
+    let e = null;
+    if (arg == null) e = ring[ring.length - 1];
+    else if (typeof arg === 'number') e = _entryBySeq(arg);
+    else e = arg;
+    if (!e) return null;
+    const u = _parseUrl(e.url);
+    return {
+      seq: e.seq,
+      url: { path: u.path, params: u.params, raw: e.url },
+      env: e.envelope, ok: e.ok, tick: e.tick, load: e.load, http200: e.http200,
+      reqLen: e.reqLen, respLen: e.respLen,
+      reqHex:   _hex(e.req,  Math.min(e.reqLen, 64)),
+      reqAscii: _ascii(e.req, Math.min(e.reqLen, 64)),
+      respHex:  _hex(e.resp, Math.min(e.respLen, 64)),
+      respAscii:_ascii(e.resp, Math.min(e.respLen, 64)),
+      reqAt: e.reqAt, respAt: e.respAt,
+    };
+  }
+
+  // Filter the ring. opts:
+  //   sinceMs        — only entries within last N ms
+  //   urlContains    — substring match on full URL
+  //   envelope       — 'P' | '0' | '\\x05' | etc
+  //   ok / tick / load / err — booleans (combine via OR)
+  //   reqLenMin / reqLenMax
+  //   respLenMin / respLenMax
+  //   reqStartsWith  — array of bytes the request body must start with
+  // Returns descriptors (no raw bytes) by default; pass withBytes:true for full.
+  function findRequests(opts) {
+    opts = opts || {};
+    const since = opts.sinceMs ? Date.now() - opts.sinceMs : 0;
+    const out = [];
+    for (const e of ring) {
+      if (e.respAt < since) continue;
+      if (opts.urlContains && (!e.url || e.url.indexOf(opts.urlContains) < 0)) continue;
+      if (opts.envelope && e.envelope !== opts.envelope) continue;
+      if (opts.reqLenMin != null && e.reqLen < opts.reqLenMin) continue;
+      if (opts.reqLenMax != null && e.reqLen > opts.reqLenMax) continue;
+      if (opts.respLenMin != null && e.respLen < opts.respLenMin) continue;
+      if (opts.respLenMax != null && e.respLen > opts.respLenMax) continue;
+      // boolean OR set
+      const wantOk = opts.ok, wantTick = opts.tick, wantLoad = opts.load, wantErr = opts.err;
+      if (wantOk != null || wantTick != null || wantLoad != null || wantErr != null) {
+        let any = false;
+        if (wantOk && e.ok) any = true;
+        if (wantTick && e.tick) any = true;
+        if (wantLoad && e.load) any = true;
+        if (wantErr && !e.ok && !e.tick && !e.load) any = true;
+        if (!any) continue;
+      }
+      if (opts.reqStartsWith && e.req) {
+        let match = true;
+        for (let i = 0; i < opts.reqStartsWith.length; i++) {
+          if (e.req[i] !== opts.reqStartsWith[i]) { match = false; break; }
+        }
+        if (!match) continue;
+      }
+      out.push(opts.withBytes ? e : describe(e));
+    }
+    return out;
+  }
+
+  // Group recent requests by their (envelope, first 4 req bytes) — a quick
+  // way to find rare opcodes (Далее should appear once per farm advance,
+  // collect actions appear constantly, ticks dominate everything else).
+  function summarize(opts) {
+    opts = opts || {};
+    const since = opts.sinceMs ? Date.now() - opts.sinceMs : 0;
+    const buckets = {};
+    for (const e of ring) {
+      if (e.respAt < since) continue;
+      const prefix = e.req && e.req.length >= 4
+        ? _hex(e.req.slice(0, 4))
+        : '(no-body)';
+      const key = (e.envelope || '?') + ' | reqPrefix=' + prefix + ' | reqLen=' + e.reqLen;
+      const b = buckets[key] || (buckets[key] = { count: 0, env: e.envelope, reqLen: e.reqLen, prefix, lastSeq: 0, lastRespLen: 0 });
+      b.count++;
+      if (e.seq > b.lastSeq) { b.lastSeq = e.seq; b.lastRespLen = e.respLen; }
+    }
+    return Object.entries(buckets)
+      .map(([k, v]) => Object.assign({ key: k }, v))
+      .sort((a, b) => a.count - b.count); // rare opcodes first — Далее candidate
+  }
+
+  // Byte-level diff of two requests' bodies + URL params. Useful to spot
+  // request_id format, monotonic counters, embedded sequence numbers.
+  function diff(seqA, seqB) {
+    const a = _entryBySeq(seqA), b = _entryBySeq(seqB);
+    if (!a || !b) return { error: 'one or both seqs not in ring' };
+    const ua = _parseUrl(a.url), ub = _parseUrl(b.url);
+    const urlDiff = { path: ua.path === ub.path ? null : [ua.path, ub.path], params: {} };
+    const allKeys = new Set([...Object.keys(ua.params), ...Object.keys(ub.params)]);
+    for (const k of allKeys) {
+      if (ua.params[k] !== ub.params[k]) urlDiff.params[k] = [ua.params[k], ub.params[k]];
+    }
+    const bodyDiff = [];
+    const aBody = a.req || [], bBody = b.req || [];
+    const max = Math.max(aBody.length, bBody.length);
+    for (let i = 0; i < max; i++) {
+      if (aBody[i] !== bBody[i]) bodyDiff.push({ off: i, a: aBody[i], b: bBody[i] });
+    }
+    return {
+      seqs: [seqA, seqB],
+      urlDiff,
+      reqLen: [aBody.length, bBody.length],
+      bodyDiff: bodyDiff.slice(0, 64),
+      bodyDiffCount: bodyDiff.length,
+      respLen: [a.respLen, b.respLen],
+      respEnv: [a.envelope, b.envelope],
+    };
+  }
+
+  // Replay a captured request. opts:
+  //   urlMutate(urlObj) → urlObj  // mutate {path, params, raw}
+  //   bodyMutate(bytes) → bytes   // mutate request body bytes
+  //   responseType: default 'arraybuffer'
+  // Returns a Promise<{status, respLen, respHex, respAscii, envelope, ok, tick, load}>
+  function replay(seq, opts) {
+    opts = opts || {};
+    const e = _entryBySeq(seq);
+    if (!e) return Promise.resolve({ error: 'seq not in ring: ' + seq });
+    if (!e.req) return Promise.resolve({ error: 'no captured req body' });
+    let url = e.url;
+    if (typeof opts.urlMutate === 'function') {
+      const u = _parseUrl(e.url);
+      const mutated = opts.urlMutate({ path: u.path, params: Object.assign({}, u.params), raw: e.url });
+      if (typeof mutated === 'string') {
+        url = mutated;
+      } else if (mutated && mutated.path) {
+        const qs = Object.entries(mutated.params || {}).map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
+        url = mutated.path + (qs ? '?' + qs : '');
+      }
+    }
+    let body = e.req.slice();
+    if (typeof opts.bodyMutate === 'function') {
+      const m = opts.bodyMutate(body);
+      if (Array.isArray(m) || (m && m.length != null)) body = Array.from(m);
+    }
+    const buf = new Uint8Array(body).buffer;
+    return new Promise((resolve) => {
+      const x = new XMLHttpRequest();
+      x.open(e.method || 'POST', url, true);
+      x.responseType = opts.responseType || 'arraybuffer';
+      x.onload = function() {
+        let respBytes = null;
+        try { respBytes = x.response instanceof ArrayBuffer ? Array.from(new Uint8Array(x.response)) : null; } catch(_) {}
+        let envelope = null, ok = false, tick = false, load = false;
+        if (respBytes && respBytes.length >= 2 && respBytes[1] === 0x00) {
+          if (respBytes[0] === 0x50)      { ok = true;   envelope = 'P'; }
+          else if (respBytes[0] === 0x30) { tick = true; envelope = '0'; }
+          else if (respBytes[0] === 0x05) { load = true; envelope = '\\x05'; }
+          else                            { envelope = String.fromCharCode(respBytes[0]); }
+        }
+        resolve({
+          status: x.status,
+          respLen: respBytes ? respBytes.length : 0,
+          respHex:  respBytes ? _hex(respBytes, Math.min(respBytes.length, 64)) : '',
+          respAscii: respBytes ? _ascii(respBytes, Math.min(respBytes.length, 64)) : '',
+          envelope, ok, tick, load,
+          urlSent: url,
+          bodyLenSent: body.length,
+        });
+      };
+      x.onerror = function() { resolve({ error: 'xhr error', status: x.status }); };
+      x.send(buf);
+    });
+  }
+
   return {
     awaitNextResponse,
     getStats() {
@@ -374,6 +608,12 @@ window.HC_Net = (function() {
     lastFarmLoadSeq,
     awaitNextFarmLoad,
     isCollectible,
+    // Endpoint-debugging surface
+    describe,
+    findRequests,
+    summarize,
+    diff,
+    replay,
     // Cheap "did anything succeed in the last N ms?" — useful for a passive
     // sanity check after a known game action.
     wasRecentSuccess(sinceMs) { return Date.now() - lastOkAt < sinceMs; },

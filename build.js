@@ -12,7 +12,7 @@ const PASTE_OUT = path.join(__dirname, 'clicker.js');
 const EXT_OUT = path.join(__dirname, 'chrome-ext', 'iframe-script.js');
 
 // Load order matters: capture stub first, then GL/network spies, then visit + ui.
-const modules = ['glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js', 'overlay.js', 'visit.js', 'ui.js'];
+const modules = ['glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js', 'overlay.js', 'visit.js', 'headless.js', 'ui.js'];
 
 function readModules() {
   return modules.map(file => ({
@@ -150,6 +150,12 @@ function buildExtBundle(mods) {
           case 'netAwait':     value = HC_Net ? await HC_Net.awaitNextResponse(args[0] || 800) : 'no HC_Net'; break;
           case 'netDump':      value = HC_Net ? HC_Net.dump(args[0] || {}) : 'no HC_Net'; break;
           case 'netClear':     HC_Net && HC_Net.clearRing(); value = { cleared: true }; break;
+          // Endpoint-debugging surface (see doc 08)
+          case 'netDescribe':   value = HC_Net ? HC_Net.describe(args[0]) : 'no HC_Net'; break;
+          case 'netFind':       value = HC_Net ? HC_Net.findRequests(args[0] || {}) : 'no HC_Net'; break;
+          case 'netSummarize':  value = HC_Net ? HC_Net.summarize(args[0] || {}) : 'no HC_Net'; break;
+          case 'netDiff':       value = HC_Net ? HC_Net.diff(args[0], args[1]) : 'no HC_Net'; break;
+          case 'netReplay':     value = HC_Net ? await HC_Net.replay(args[0], args[1] || {}) : 'no HC_Net'; break;
           case 'netFarmObjects': {
             if (!HC_Net) { value = 'no HC_Net'; break; }
             const r = HC_Net.lastFarmObjects(args[0] || {});
@@ -196,6 +202,21 @@ function buildExtBundle(mods) {
             const vx = r.left + args[0] / sx;
             const vy = r.top  + args[1] / sy;
             value = await window.HC_DbgClick.click(vx, vy);
+            break;
+          }
+          // ── Headless replay loop (doc 08) ──
+          case 'headlessRun':       value = HC_Headless ? await HC_Headless.runCycle(args[0] || {}) : 'no HC_Headless'; break;
+          case 'headlessStop':      HC_Headless && HC_Headless.stop(); value = { stopped: true }; break;
+          case 'headlessFriends':   value = HC_Headless ? await HC_Headless.fetchFriendList() : 'no HC_Headless'; break;
+          case 'headlessParseLast': {
+            if (!HC_Headless || !HC_Net) { value = 'no HC_Headless'; break; }
+            const all = HC_Net.findRequests({ sinceMs: 60000, withBytes: true });
+            const farm = all.filter(e => e.respLen >= 8000).slice(-1)[0];
+            if (!farm) { value = { error: 'no farm-load in ring' }; break; }
+            const objs = HC_Headless.parseFarmLoadV2(farm.resp);
+            const counts = {};
+            for (const o of objs) counts[o.type] = (counts[o.type] || 0) + 1;
+            value = { seq: farm.seq, respLen: farm.respLen, objectCount: objs.length, types: counts, sample: objs.slice(0, 8) };
             break;
           }
           case 'visitSweep':       value = HC_Visit ? await HC_Visit.sweepOnce() : 'no HC_Visit'; break;

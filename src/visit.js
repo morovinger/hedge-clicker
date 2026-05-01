@@ -20,7 +20,11 @@ window.HC_Visit = (function() {
   const BTN = {
     home:     { x: 80,  y: 660 }, // "Выйти" — bottom-left, returns from friend farm
     next:     { x: 200, y: 660 }, // "Далее" — bottom-left, appears once farm is exhausted
-    popupNext:{ x: 500, y: 310 }, // "Далее" inside the centered "nothing more to do" popup
+    popupNext:{ x: 476, y: 369 }, // "Далее" inside the centered "nothing more to do" popup
+                                  // (re-calibrated 2026-05-01 via the panel picker;
+                                  // the old (500, 310) was a guess and missed by ~60 px,
+                                  // which left the popup up and silently blocked
+                                  // BTN.next clicks too. See doc 07.)
     voyage:   { x: 765, y: 260 }, // "В путь!" on TRAVELS_HUB
     travels:  { x: 0,   y: 0   }, // "Путешествия" on main farm — TBD
     sessionEndOk: { x: 0, y: 0 }, // confirm on "backpack full" dialog — TBD
@@ -45,7 +49,7 @@ window.HC_Visit = (function() {
     minOkPerSweep:    3,     // unused when maxSweepsPerFarm=1, kept for manual override
     hubProbeGap:      400,   // ms between hub farm-icon probe clicks
     hubProbeTimeout:  1500,  // ms to await a farm-load XHR after each probe
-    maxHubAttempts:   24,    // bound probes per enterFromHub call
+    maxHubAttempts:   32,    // bound probes per enterFromHub call (HUB_PROBES = 4 confirmed + 25 grid = 29)
     stopAfterEmptyAdvances: 2, // backpack-full proxy: stop after N advances that produce no new farm-load
     // 'auto' = use parsed list when HC_Net has decoded objects AND the
     // projected coords land inside the canvas; else fall back to grid.
@@ -202,11 +206,21 @@ window.HC_Visit = (function() {
   }
 
   // ── Hub entry: probe known farm-icon positions until one loads a farm ──
-  // Coarse grid covering the hub playfield; hub farm icons are usually
-  // ~80–120 px wide so a ~150 px grid usually hits at least one.
-  const HUB_PROBES = [];
-  for (let y = 220; y <= 520; y += 100) {
-    for (let x = 200; x <= 850; x += 130) HUB_PROBES.push({ x, y });
+  // The friends-hub renders friend-farm icons inside a central panel, not
+  // across the full playfield. The original 24-point wide grid (x 200–850
+  // step 130, y 220–520 step 100) missed every icon in the user's actual
+  // layout — calibrated 2026-05-01 via the panel picker.
+  // Strategy: try four user-confirmed icon coords first (almost certainly
+  // hits one), then a tight 5×5 grid around the cluster as a fallback.
+  const HUB_PROBES = [
+    // Confirmed friend-icon positions (panel-picker calibration, 2026-05-01)
+    { x: 408, y: 233 },
+    { x: 529, y: 305 },
+    { x: 544, y: 414 },
+    { x: 512, y: 445 },
+  ];
+  for (let y = 220; y <= 460; y += 60) {
+    for (let x = 380; x <= 580; x += 50) HUB_PROBES.push({ x, y });
   }
 
   async function enterFarmFromHub(opts) {
@@ -255,16 +269,18 @@ window.HC_Visit = (function() {
       stats.passes++;
       log('sweep done: ok=' + r.ok + ' items=' + r.resourceItems + ' (resp ' + r.withResources + '/' + r.ackCount + ') totalAttempts=' + stats.attempts + ' clickFails=' + clickFails);
 
-      // Server-side signal: if EVERY P\0 ack we got back included no ra_*
-      // resource record, the backpack is full (or the farm has nothing left
-      // to give). Two such sweeps in a row → stop. This is the byte-level
-      // signal the previous version was lacking; it's far more decisive
-      // than the empty-advance counter.
+      // Items in the response = resources DROPPED INTO PLAYER STORAGE
+      // (shared across farms, capped by inventory free-space). NOT a
+      // signal that the current farm has more loot.
+      // If r.ackCount > 0 but r.withResources === 0, every click was a
+      // "you got nothing" ack — the inventory cap is hit (or, less likely,
+      // we somehow sweeped only terrain). Backpack-full is the dominant
+      // cause; stop after 2 such sweeps in a row.
       if (r.ackCount > 0 && r.withResources === 0) {
         zeroCollectSweeps++;
-        log('zero-resource sweep #' + zeroCollectSweeps + ' (acks=' + r.ackCount + ', items=0) — likely backpack full or farm exhausted');
+        log('zero-resource sweep #' + zeroCollectSweeps + ' (acks=' + r.ackCount + ', items=0) — likely backpack full');
         if (zeroCollectSweeps >= 2) {
-          log('STOP: 2 consecutive sweeps with no ra_* collected — backpack likely full');
+          log('STOP: 2 consecutive sweeps with no ra_* collected — backpack full');
           running = false;
           return;
         }
@@ -301,15 +317,21 @@ window.HC_Visit = (function() {
   }
 
   // Click each candidate Далее position in order, awaiting a farm-load XHR
-  // after each. Returns true on the first that produces one. Candidates:
-  //   1. Popup-center "Далее" (canvas ~497, 380) — appears only when farm
-  //      is fully exhausted; bottom-left button is disabled while popup is up.
-  //   2. Bottom-left Далее (BTN.next, default 200, 660) — present after any
-  //      collection.
+  // after each. Returns true on the first that produces one.
+  //
+  // The Далее popup ("Здесь нам делать больше нечего, отправляемся дальше!")
+  // is rendered AT THE PLAYER CHARACTER'S WORLD POSITION, which changes per
+  // farm. So a fixed coord misses on most farms. Strategy:
+  //   1. Try BTN.popupNext (cached from last picker / successful advance).
+  //   2. Try BTN.next (bottom-left button — exists on some layouts).
+  //   3. Probe-scan a small grid covering the canvas's central ~half where
+  //      the popup almost always lands. First click that produces a
+  //      farm-load XHR wins.
+  // The scan adds ~2–10s in the worst case, vs failing the advance entirely.
   async function tryAdvance(seqBefore) {
     const candidates = [
-      { name: 'popup-Далее', x: BTN.popupNext.x, y: BTN.popupNext.y },
-      { name: 'btn-Далее',   x: BTN.next.x, y: BTN.next.y },
+      { name: 'popup-Далее (cached)', x: BTN.popupNext.x, y: BTN.popupNext.y },
+      { name: 'btn-Далее',            x: BTN.next.x,      y: BTN.next.y      },
     ];
     for (const c of candidates) {
       if (!running) return false;
@@ -318,11 +340,31 @@ window.HC_Visit = (function() {
       const newSeq = await net.awaitNextFarmLoad({ afterSeq: seqBefore, timeoutMs: VCFG.advanceWait });
       if (newSeq != null && newSeq !== seqBefore) {
         log('advance OK via ' + c.name + ' → seq=' + newSeq);
-        await sleep(600); // settle in new farm
+        await sleep(600);
         return true;
       }
       log('  ' + c.name + ' produced no farm-load');
     }
+
+    // Fallback popup-hunt: dense probe in the central canvas area where the
+    // popup is rendered. On a hit, cache the coord so the next farm gets the
+    // fast path.
+    log('popup-hunt: scanning central canvas for Далее button…');
+    for (let y = 200; y <= 470; y += 35) {
+      for (let x = 280; x <= 720; x += 35) {
+        if (!running) return false;
+        click(x, y);
+        const newSeq = await net.awaitNextFarmLoad({ afterSeq: seqBefore, timeoutMs: 350 });
+        if (newSeq != null && newSeq !== seqBefore) {
+          BTN.popupNext.x = x;
+          BTN.popupNext.y = y;
+          log('popup-hunt HIT @ (' + x + ',' + y + ') → seq=' + newSeq + ' — cached as BTN.popupNext');
+          await sleep(600);
+          return true;
+        }
+      }
+    }
+    log('popup-hunt exhausted — no advance found');
     return false;
   }
 
