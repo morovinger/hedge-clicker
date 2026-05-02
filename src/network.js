@@ -587,6 +587,11 @@ window.HC_Net = (function() {
           envelope, ok, tick, load,
           urlSent: url,
           bodyLenSent: body.length,
+          // Full response bytes — callers that need to parse the body (farm-loads,
+          // collect deltas, server error reasons) get the bytes directly instead
+          // of fishing the ring for a sibling entry. Sidechannel lookup races
+          // against background game traffic when the server is in an error loop.
+          resp: respBytes,
         });
       };
       x.onerror = function() { resolve({ error: 'xhr error', status: x.status }); };

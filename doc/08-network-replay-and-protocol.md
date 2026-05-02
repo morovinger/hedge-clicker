@@ -202,6 +202,23 @@ Not every parsed object is collectible. Server returns `"FriendAction: does not 
 | `fe_` | Field / fence | No |
 | `ra_` | Resource (in inventory) — appears in own-farm load | N/A |
 
+## Error response taxonomy
+
+All error responses use the `00 00` envelope and mirror the request opcode in the next 2 bytes (`00 3d`). Byte 5 is the **error code**; the meaning of subsequent bytes depends on the code. Confirmed codes (2026-05-03):
+
+| Code | Resp len | Trailing text? | Meaning | Triggered by |
+|---|---|---|---|---|
+| `0x02` | 11 B | none | state mismatch / wrong farm context | replay-driven session-state desync — usually after a previous cycle didn't terminate cleanly. Page reload fixes. |
+| `0x13` | small + text | `"expired request"` | request_id rejected (reused or non-monotonic) | bad `request_id` generation — see "request_id semantics". |
+| `0x32` | 59 B | `dumps'.<player_uuid>_<eid_suffix>` | object cannot be collected | calling collect on an object that's in our `collectibles` list but the server says no — wrong type, wrong state, not ready, scenery (e.g. some `pl_*` event variants, `ga_tree` subtypes). **Does not consume quota.** Free "no" from the server. |
+| `0x61` | 106 B | `"FriendAction: does not have availible actions"` | per-friend daily quota exhausted | hits after the 12th successful collect on a given friend that day. Definitive "stop sweeping this farm" signal. |
+
+Practical impact in the headless loop: per friend we attempt ~20 of the 50 parsed collectibles and get the typical `ok=12 / err=8` split. Of those 8 errors, ~7 are `0x32` (object-not-collectible — noise we can't predict) and 1 is `0x61` (quota — the real stop signal). Both are server rejections, neither penalises the player, neither corrupts state. The 12-cap per friend is the daily game-rule limit, not a side-effect of our attempts.
+
+Two cheap wins if `0x32` noise becomes worth optimising:
+- Reorder collectibles so the high-success types (`te_*`, `sb_seedbed`, `ga_wild_*`) go first; quota typically hits before we walk into the doubtful types.
+- Tighten `COLLECTIBLE_PREFIXES` / `COLLECTIBLE_GA_RE` once a per-error type table is captured.
+
 ## Per-click collect-response format (from earlier)
 
 Each `P\0` ack carries the resource delta:
@@ -241,6 +258,12 @@ await N.replay(seq, {urlMutate(u){...}, bodyMutate(b){...}})
 
 Bridge commands (from parent frame): `netSummarize`, `netFind`, `netDescribe`, `netDiff`, `netReplay`.
 
+## Cycle-end canvas state
+
+After a full headless cycle, the canvas shows **travel-prep** (`screenshots/travel-prep.png`), not own-farm (`screenshots/own-farm.png`). The PIXI client never received a "back to home" signal because the headless path skips the trailing UI transitions. This is purely cosmetic for the headless loop — it neither clicks any button nor reads the canvas, so a second `runCycle()` immediately after the first works without any reset. Server-side state advances regardless of canvas position; the next В путь will fetch a fresh candidate list and the cycle proceeds.
+
+What this *doesn't* mean: more loot per session. After a complete 10-friend sweep, every candidate's per-friend daily quota is burned, so back-to-back cycles will return identical-looking traffic with `ok=0` collects (or trigger backpack-full immediately if anything was collectible). Useful only when (a) a cycle was interrupted partway, or (b) the daily reset has elapsed (game time, not real time — unverified when).
+
 ## Other gotchas confirmed this session
 
 - **Hidden tab kills clicks.** When the game tab is not foregrounded, `Input.dispatchMouseEvent` hangs silently — not an error, just never resolves. Background tab → DbgClick timeouts climb monotonically. User must keep the game window foregrounded.
@@ -258,12 +281,17 @@ await H.runCycle({ maxFriends: 4, interMs: 100 });
 H.getLog();
 ```
 
-Status (2026-05-01, end of session):
+Status (verified 2026-05-03 — fresh-page 10-friend run):
 - ✅ В путь fabricated, friend list parsed (10 UUIDs)
-- ✅ enter-friend, Далее replays accepted by server
-- ✅ Farm-load parser-v3 finds 1247 records on a real 1.77 MB load
-- ✅ Server-error reasons surfaced in log (e.g. quota-hit detection)
-- ⚠️ Initial run hit "FriendAction: does not have availible actions" because the test friend's daily quota was already burned by manual clicks earlier in the session. Pristine test pending.
+- ✅ enter-friend, Далее, collect replays all accepted by server
+- ✅ Farm-load parser finds 1247 records on real 1.77 MB loads (consistent across all 10 friends)
+- ✅ Backpack-full detection wired (`parseCollectResp(r.resp).resources.length === 0` × 5 in a row → break cycle)
+- ✅ Per-cycle loot aggregation: `ra_leaf:120, ra_dry_grass:27` from a full 10-friend sweep
+- ✅ Error reasons read from `r.resp` directly (no more ring-sidechannel race)
+
+**Bug fixed this round:** `HC_Net.replay` previously returned only the first 64 bytes of the response (hex/ascii preview). Callers had to re-fetch the response from the ring, which races against the game's error-retry flood and grabs a wrong sibling entry. Symptom: collect-error log lines showed `P\0 04 3d ...Exp...Coins...ra_leaf` (a stale success ack) while still incrementing the err counter. Fix: `replay` now returns the full `resp` byte array; `enterFriendFarm`, `dalee`, `collectAll` consume it directly.
+
+**Cross-realm gotcha** for any future MCP-based hot-patching: the wrapper's `body instanceof ArrayBuffer` check is anchored in the iframe's realm. Patches injected via main-frame `eval` create cross-realm ArrayBuffers — `instanceof` returns false, `bodyToBytes` returns null, and the ring records `req=null`. Always inject via a `<script>` element appended to the iframe document, or do an extension reload.
 
 Body builders use a **"copy template, mutate trailing 32 bytes"** strategy — they grab a captured 0500 013d / 5000 093d request from the ring and only replace the friend ID portion. This avoids per-game-version byte-ordering bugs (we hit one with enter-farm where my initial fabricated header had the flag bytes off by one, causing the server to silently return a profile-ack instead of a farm-load).
 
@@ -273,7 +301,8 @@ Bridge commands wired in `build.js`: `headlessRun`, `headlessStop`, `headlessFri
 
 1. ~~Where does the next-friend ID come from inside a travel cycle?~~ **Resolved** — В путь response carries the full candidate friend list (10 entries observed) as length-prefixed UUIDs.
 2. ~~What does the `0500 013d` flag-byte difference mean (`01 00 00 00` vs `00 00 01 01`)?~~ Likely irrelevant — copying the captured template's bytes verbatim works regardless.
-3. How does the server pick the 4–5 cycle members from the 10 candidates? Could be first-N, weighted by badge count, or random. Likely we don't need to predict — just iterate the list and let the server reject when quota is hit.
-4. Does the server expose an "end of cycle" signal, or is it inferred from a farm-load that returns to the home/hub state?
-5. Confirm the `ga_*` collectible subtypes by running a clean cycle on a fresh-quota friend — currently `COLLECTIBLE_GA_RE = /^ga_(wild_|tree$|wild_onion)/` is best-guess.
+3. ~~How does the server pick the 4–5 cycle members from the 10 candidates?~~ **Resolved** — there isn't a 4–5 selection. The server returns 10 candidates and we iterate all of them; each friend has a flat 12-action daily limit (signalled by `0x61` "FriendAction: does not have availible actions"). Earlier "4–5 farm" guess was a UI artefact, not a server constraint.
+4. Does the server expose an "end of cycle" signal? Empirically no — every Далее returns a fresh farm-load, including the one that follows the last "real" friend; the cycle simply iterates `fl.friends.length`. Cosmetic canvas state ends on **travel-prep** (see "Cycle-end canvas state" above).
+5. Confirm the `ga_*` collectible subtypes — `COLLECTIBLE_GA_RE = /^ga_(wild_|tree$|wild_onion)/` is best-guess. The 2026-05-03 run yielded 12 collects per friend (all `ra_leaf` + occasional `ra_dry_grass`); the `ga_*` items in the parsed list never came up before quota hit, so the regex is unverified. Worth dumping the per-error eid+type table on a future run to learn which subtypes silently bounce as `0x32`.
 6. Decode `\x10` envelope (own-farm collect ack) so the headless loop can also drive own-farm chores.
+7. When does the daily-action quota reset? Real-clock midnight, server-clock midnight, or rolling 24h? Confirm by running back-to-back cycles separated by a long pause.

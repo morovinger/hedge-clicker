@@ -1,5 +1,5 @@
 // Hedgehog Clicker — Chrome extension content script (auto-injected into game iframe)
-// Built: 2026-05-01
+// Built: 2026-05-02
 // Runs at document_start in MAIN world inside https://valley.redspell.ru/play/vk/index.html
 
 (function() {
@@ -919,6 +919,11 @@
             envelope, ok, tick, load,
             urlSent: url,
             bodyLenSent: body.length,
+            // Full response bytes — callers that need to parse the body (farm-loads,
+            // collect deltas, server error reasons) get the bytes directly instead
+            // of fishing the ring for a sibling entry. Sidechannel lookup races
+            // against background game traffic when the server is in an error loop.
+            resp: respBytes,
           });
         };
         x.onerror = function() { resolve({ error: 'xhr error', status: x.status }); };
@@ -2231,16 +2236,9 @@
         log('entering friend ' + friendHex32.slice(0, 8) + '…');
         const r = await send([0x05, 0x00, 0x01, 0x3d], buildEnterFarm(friendHex32), { proto: '5x1' });
         log('  enter result: env=' + r.envelope + ' ok=' + r.ok + ' load=' + r.load + ' respLen=' + r.respLen);
-        await sleep(300);
-        // The replay's response landed in the ring as the most recent entry.
-        // We want either a \x05 farm-load, OR the larger of the two acks
-        // (sometimes the farm bytes come back in the P\0 ack).
-        const recent = N.findRequests({ sinceMs: 5000, withBytes: true });
-        let farmLoad = null;
-        for (let i = recent.length - 1; i >= 0; i--) {
-          const e = recent[i];
-          if (e.respLen >= 5000) { farmLoad = e; break; }
-        }
+        // Use replay's own bytes — game's error-retry flood can evict ring entries
+        // before we can read them back.
+        const farmLoad = (r.resp && r.respLen >= 5000) ? { resp: r.resp, respLen: r.respLen } : null;
         return { result: r, farmLoad };
       }
     
@@ -2248,6 +2246,10 @@
         opts = opts || {};
         const interMs = opts.interMs != null ? opts.interMs : 80;
         const stopOnConsecErrors = opts.stopOnConsecErrors != null ? opts.stopOnConsecErrors : 5;
+        // Backpack-full signal (per doc 08): server keeps returning P\0 acks but
+        // with no ra_* records. After this many consecutive empty-ok responses we
+        // assume the backpack is full and abort the whole cycle.
+        const stopOnConsecEmpty = opts.stopOnConsecEmpty != null ? opts.stopOnConsecEmpty : 5;
         const objs = parseFarmLoadV2(farmLoadBytes);
         const collectibles = objs.filter(o => isCollectibleType(o.type));
         // Type histogram for diagnostics
@@ -2256,21 +2258,39 @@
         log('  parsed ' + objs.length + ' total / ' + collectibles.length + ' collectibles: ' +
             Object.entries(typeHist).map(([k, v]) => k + ':' + v).join(' '));
         let tried = 0, acks = 0, errs = 0, consecErr = 0, quotaHit = false;
+        let withRes = 0, withoutRes = 0, consecEmpty = 0, backpackFull = false;
+        const resourceTotals = {};
         for (const o of collectibles) {
           if (!running) break;
           const tc = typeCodeFor(o.type);
           if (tc === 0x00) continue;
           const r = await send([0x50, 0x00, 0x03, 0x3d], buildCollect(friendUuidWithDashes, tc, o.eid, o.type), { proto: '50x3' });
           tried++;
-          if (r.ok) { acks++; consecErr = 0; }
-          else {
+          if (r.ok) {
+            acks++; consecErr = 0;
+            // Parse the ack to detect backpack-full. resources excludes Exp/Coins/Energy.
+            const p = N.parseCollectResp(r.resp);
+            if (p && p.resources && p.resources.length > 0) {
+              withRes++; consecEmpty = 0;
+              for (const rec of p.resources) {
+                resourceTotals[rec.name] = (resourceTotals[rec.name] || 0) + rec.value;
+              }
+            } else {
+              withoutRes++; consecEmpty++;
+              if (consecEmpty >= stopOnConsecEmpty) {
+                backpackFull = true;
+                log('  backpack full — ' + consecEmpty + ' consecutive ok-but-empty acks');
+                break;
+              }
+            }
+          } else {
             errs++;
             consecErr++;
-            // The response ASCII often includes the error reason; read it from the ring.
+            // Read the error reason from r.resp directly (the ring sidechannel
+            // races against the game's error-retry flood and grabs the wrong entry).
             if (errs <= 2 || consecErr === stopOnConsecErrors) {
-              const last = N.findRequests({ sinceMs: 5000, withBytes: true }).slice(-1)[0];
-              const reason = last && last.resp ? Array.from(last.resp).slice(0, 80).map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : '.').join('') : '';
-              log('    err #' + errs + ': ' + reason);
+              const reason = r.resp ? r.resp.slice(0, 80).map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : '.').join('') : '(no resp)';
+              log('    err #' + errs + ' env=' + r.envelope + ' len=' + r.respLen + ': ' + reason);
               if (reason.indexOf('does not have availible actions') >= 0 ||
                   reason.indexOf('does not have available actions') >= 0) {
                 quotaHit = true;
@@ -2283,20 +2303,38 @@
           }
           await sleep(interMs);
         }
-        log('  collect pass: tried=' + tried + ' ok=' + acks + ' err=' + errs + (quotaHit ? ' QUOTA' : ''));
-        return { tried, acks, errs, quotaHit };
+        const lootSummary = Object.entries(resourceTotals).map(([k, v]) => k + ':' + v).join(' ') || '(none)';
+        log('  collect pass: tried=' + tried + ' ok=' + acks +
+            ' (loot:' + withRes + ' empty:' + withoutRes + ') err=' + errs +
+            (quotaHit ? ' QUOTA' : '') + (backpackFull ? ' BACKPACK_FULL' : ''));
+        if (withRes > 0) log('    loot: ' + lootSummary);
+        return { tried, acks, errs, quotaHit, withRes, withoutRes, backpackFull, resourceTotals };
       }
     
       async function dalee(nextFriendHex32) {
         log('Далее → ' + nextFriendHex32.slice(0, 8) + '…');
         const r = await send([0x50, 0x00, 0x09, 0x3d], buildDalee(nextFriendHex32), { proto: '50x9' });
         log('  Далее result: env=' + r.envelope + ' ok=' + r.ok + ' respLen=' + r.respLen);
-        await sleep(300);
-        const recent = N.findRequests({ sinceMs: 5000, withBytes: true });
+        // Per doc 08, the server returns two responses 5s apart for Далее: a small
+        // P\0 ack first, then the \x05 farm-load. Wait for the farm-load to land
+        // in the ring (only the second response carries the next farm's bytes).
         let farmLoad = null;
-        for (let i = recent.length - 1; i >= 0; i--) {
-          const e = recent[i];
-          if (e.respLen >= 5000) { farmLoad = e; break; }
+        if (r.respLen >= 5000) {
+          farmLoad = { resp: r.resp, respLen: r.respLen };
+        } else {
+          // Small ack — poll the ring for the trailing farm-load.
+          const sinceSeq = N.findRequests({ sinceMs: 60000 }).slice(-1)[0]?.seq || 0;
+          const t0 = Date.now();
+          while (Date.now() - t0 < 8000) {
+            const recent = N.findRequests({ sinceMs: 8000, withBytes: true });
+            for (let i = recent.length - 1; i >= 0; i--) {
+              const e = recent[i];
+              if (e.seq <= sinceSeq) break;
+              if (e.load && e.respLen >= 5000) { farmLoad = e; break; }
+            }
+            if (farmLoad) break;
+            await sleep(200);
+          }
         }
         return { result: r, farmLoad };
       }
@@ -2312,20 +2350,39 @@
           log('=== headless cycle START ===');
           const fl = await fetchFriendList();
           if (!fl.friends || fl.friends.length === 0) { log('STOP — no friends'); return; }
-          const max = opts.maxFriends || Math.min(fl.friends.length, 5);
-          log('cycle plan: ' + max + ' friends');
+          // Default: iterate every candidate the В путь response gave us. The cycle
+          // self-terminates when the backpack fills, so an explicit cap is only
+          // useful for debug runs (e.g. maxFriends: 1).
+          const max = opts.maxFriends || fl.friends.length;
+          log('cycle plan: up to ' + max + ' friends (will stop on backpack-full)');
+          const totalLoot = {};
+          let visited = 0, backpackFull = false, quotaCount = 0;
           for (let i = 0; i < max; i++) {
             if (!running) { log('aborted'); break; }
             const f = fl.friends[i];
             log('— friend ' + (i + 1) + '/' + max + ' uuid=' + f.uuid);
             const enter = await enterFriendFarm(f.hex32);
             if (!enter.farmLoad) { log('  no farm-load captured; skipping collect'); }
-            else { await collectAll(f.uuid, enter.farmLoad.resp, opts); }
+            else {
+              const result = await collectAll(f.uuid, enter.farmLoad.resp, opts);
+              visited++;
+              if (result.quotaHit) quotaCount++;
+              if (result.resourceTotals) {
+                for (const k of Object.keys(result.resourceTotals)) {
+                  totalLoot[k] = (totalLoot[k] || 0) + result.resourceTotals[k];
+                }
+              }
+              if (result.backpackFull) { backpackFull = true; break; }
+            }
             if (i + 1 < max) {
               await dalee(fl.friends[i + 1].hex32);
             }
           }
-          log('=== headless cycle END ===');
+          const lootStr = Object.entries(totalLoot).map(([k, v]) => k + ':' + v).join(' ') || '(none)';
+          log('=== headless cycle END (visited=' + visited +
+              ', quotaHits=' + quotaCount +
+              (backpackFull ? ', BACKPACK_FULL' : '') +
+              ') loot: ' + lootStr + ' ===');
         } catch (e) {
           log('CRASH: ' + (e && e.stack || e));
         } finally {
@@ -2336,8 +2393,35 @@
       function stop() { running = false; log('stop requested'); }
       function isRunning() { return running; }
     
+      function help() {
+        const lines = [
+          'HC_Headless — pure-XHR friend-farm cycle (no canvas clicks).',
+          '',
+          'Console one-liners (inside the game iframe):',
+          '  HC_Headless.runCycle()              // full cycle, all candidate friends, stops on backpack-full',
+          '  HC_Headless.runCycle({maxFriends:1})// debug: visit a single friend',
+          '  HC_Headless.runCycle({interMs:200}) // slower per-collect spacing (default 80ms)',
+          '  HC_Headless.stop()                  // abort the running cycle',
+          '  HC_Headless.isRunning()             // bool',
+          '  HC_Headless.getLog()                // last 200 log lines',
+          '  HC_Headless.clearLog()',
+          '',
+          'From the parent frame:',
+          "  H = document.querySelector('iframe').contentWindow.HC_Headless",
+          '  H.runCycle()',
+          '',
+          'Cycle stops on: backpack full (5 consecutive ok-but-empty acks), or all',
+          'candidate friends visited, or stop() called.',
+        ];
+        console.log(lines.join('\n'));
+        return lines.join('\n');
+      }
+    
+      // One-shot banner so the user sees the entry points on first install.
+      console.log('[HC_Headless] installed. Type HC_Headless.help() for usage.');
+    
       return {
-        runCycle, stop, isRunning,
+        runCycle, stop, isRunning, help,
         // helpers exposed for debugging / panel use
         fetchFriendList,
         enterFriendFarm,

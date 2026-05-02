@@ -11,6 +11,8 @@ This folder is the project's design log. Numbered files are written in order; la
 | [05](05-network-api-discovery.md) | Game API discovery (binary RPC over `/proto.html`) | Live capture — path to fully headless |
 | [06](06-farm-state-decoding.md) | Decode farm-load XHR for resource positions | Parser shipped — live calibration pending |
 | [07](07-autonomous-visit-loop.md) | Autonomous farm-to-farm Visit loop | Working primitive — popup advance + hub bootstrap need live tuning |
+| [08](08-network-replay-and-protocol.md) | Network replay & travel-cycle protocol | Live — replay engine + error taxonomy decoded |
+| [09](09-current-setup.md) | Current setup & how it works | **Start here** — fast on-ramp for the headless cycle |
 
 Source code lives in `../src/`. The main project README is `../README.md`.
 
