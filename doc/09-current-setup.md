@@ -99,9 +99,15 @@ If you're picking this up, the diffs from `main` worth understanding:
 
 ## Running it
 
-The extension auto-injects on `https://valley.redspell.ru/` (and the VK wrapper URLs). Assuming you're signed into VK in the same Chrome profile and the game has loaded:
+The extension auto-injects on `https://valley.redspell.ru/` (and the VK wrapper URLs). Assuming you're signed into VK in the same Chrome profile and the game has loaded, you have two ways to drive the cycle:
 
-Open DevTools on the game tab. Console:
+### From the panel (quickest)
+
+The Hedgehog Vision panel (top-right of the game tab) has a **▶ Headless Run** button at the top. Click it; the status row switches to "HEADLESS RUNNING" and the log box mirrors `HC_Headless.getLog()` interleaved with any `HC_Visit` activity. **■ Stop** aborts. The legacy `START Visit` button below still drives the click-based loop independently.
+
+### From the console (more flexible)
+
+Open DevTools on the game tab:
 
 ```js
 // Bind once (game's iframe is same-origin on the bare URL)
@@ -114,6 +120,8 @@ HH.runCycle({ interMs: 200 })   // slower per-collect spacing (default 80 ms)
 HH.stop()                       // abort
 HH.getLog().slice(-30)          // last 30 log lines
 ```
+
+The console route is needed for any non-default options (`maxFriends`, `interMs`, `stopOnConsecEmpty`); the panel button always uses the defaults.
 
 Expected for a clean run, all-fresh-quota:
 

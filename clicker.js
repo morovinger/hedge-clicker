@@ -2457,6 +2457,7 @@
   window.HC_UI = (function() {
     const cap = window.HC_Capture;
     const visit = window.HC_Visit;
+    const headless = window.HC_Headless; // may be undefined if loaded in older bundles
     const canvas = cap.canvas;
   
     const old = document.getElementById('hc-panel');
@@ -2482,7 +2483,11 @@
       <div id="hc-body">
         <div id="hc-st">STOPPED</div>
         <div class="hbs">
-          <button class="hb g" id="hc-tog">START Visit (F2)</button>
+          <button class="hb g" id="hc-headless-run">▶ Headless Run</button>
+          <button class="hb r" id="hc-headless-stop">■ Stop</button>
+        </div>
+        <div class="hbs">
+          <button class="hb g" id="hc-tog" style="font-size:11px">START Visit (F2)</button>
         </div>
         <div class="hbs">
           <button class="hb o" id="hc-sweep" style="font-size:11px">Sweep Once</button>
@@ -2524,6 +2529,17 @@
     });
   
     // ── Buttons ──
+    document.getElementById('hc-headless-run').addEventListener('click', () => {
+      if (!headless) { console.warn('[HC_UI] HC_Headless not loaded — rebuild & reload extension'); return; }
+      if (headless.isRunning()) { console.log('[HC_UI] headless already running — stop first'); return; }
+      console.log('[HC_UI] Headless Run clicked');
+      headless.runCycle();
+    });
+    document.getElementById('hc-headless-stop').addEventListener('click', () => {
+      if (!headless) return;
+      console.log('[HC_UI] Headless Stop clicked');
+      headless.stop();
+    });
     document.getElementById('hc-tog').addEventListener('click', () => {
       console.log('[HC_UI] START button clicked, visit.isRunning=' + visit.isRunning());
       visit.toggle();
@@ -2547,6 +2563,7 @@
     });
     document.getElementById('hc-clear-log').addEventListener('click', () => {
       visit.clearLog();
+      if (headless) headless.clearLog();
       document.getElementById('hc-log').textContent = '';
     });
   
@@ -2582,14 +2599,25 @@
     function updateUI() {
       const st = document.getElementById('hc-st'), btn = document.getElementById('hc-tog');
       const r = visit.isRunning();
+      const hr = headless && headless.isRunning();
       const s = visit.getStats();
       const cc = visit.getClickCounters();
-      if (r) {
-        st.textContent = 'RUNNING'; st.style.background = 'rgba(106,48,147,.5)'; st.style.color = '#b388ff';
-        btn.textContent = 'STOP Visit (F2)'; btn.className = 'hb r';
+      // Status row: HEADLESS RUNNING > VISIT RUNNING > STOPPED
+      if (hr) {
+        st.textContent = 'HEADLESS RUNNING'; st.style.background = 'rgba(46,125,50,.5)'; st.style.color = '#a5d6a7';
+      } else if (r) {
+        st.textContent = 'VISIT RUNNING'; st.style.background = 'rgba(106,48,147,.5)'; st.style.color = '#b388ff';
       } else {
         st.textContent = 'STOPPED'; st.style.background = 'rgba(192,57,43,.3)'; st.style.color = '#ff6b6b';
-        btn.textContent = 'START Visit (F2)'; btn.className = 'hb g';
+      }
+      if (r) { btn.textContent = 'STOP Visit (F2)'; btn.className = 'hb r'; }
+      else   { btn.textContent = 'START Visit (F2)'; btn.className = 'hb g'; }
+      // Headless run/stop button enable/disable feedback
+      const runBtn = document.getElementById('hc-headless-run');
+      const stopBtn = document.getElementById('hc-headless-stop');
+      if (runBtn && stopBtn) {
+        runBtn.style.opacity = (headless && !hr) ? '1' : '.5';
+        stopBtn.style.opacity = hr ? '1' : '.5';
       }
       document.getElementById('hc-stats').textContent =
         'Passes: ' + s.passes + ' | Hits: ' + s.hits + ' | Attempts: ' + s.attempts +
@@ -2599,11 +2627,21 @@
       document.getElementById('hc-diag').textContent =
         'DbgClick: ' + (dbg ? ('avail=' + dbg.isAvailable() + ' clicks=' + cc.clicks + ' fails=' + cc.fails) : 'MISSING') +
         ' | Net: ' + (net ? ('seen=' + net.totalSeen + ' ok=' + net.totalOk + ' err=' + net.totalErr) : 'MISSING');
+      // Log: merge visit + headless lines, sorted by their leading [HH:MM:SS] timestamp
+      // (both modules use the same prefix format, so a lexicographic sort interleaves
+      // them correctly within the same hour).
       const logEl = document.getElementById('hc-log');
-      const lines = visit.getLog();
-      if (lines.length) {
+      const visitLog = visit.getLog() || [];
+      const headlessLog = (headless && headless.getLog()) || [];
+      let merged;
+      if (visitLog.length && headlessLog.length) {
+        merged = visitLog.concat(headlessLog).sort();
+      } else {
+        merged = visitLog.length ? visitLog : headlessLog;
+      }
+      if (merged.length) {
         const wasAtBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 5;
-        logEl.textContent = lines.join('\n');
+        logEl.textContent = merged.join('\n');
         if (wasAtBottom) logEl.scrollTop = logEl.scrollHeight;
       }
     }
