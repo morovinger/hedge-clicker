@@ -98,7 +98,9 @@ If you're picking this up, the diffs from `main` worth understanding:
 
 ## Running it
 
-The extension auto-injects on `https://valley.redspell.ru/` (and the VK wrapper URLs). Assuming you're signed into VK in the same Chrome profile and the game has loaded, you have two ways to drive the cycle:
+The extension auto-injects on `https://valley.redspell.ru/` (and the VK wrapper URLs). Assuming you're signed into VK in the same Chrome profile and the game has loaded, you have two ways to drive the cycle.
+
+**Which URL to open (2026-10-23).** The bare `https://valley.redspell.ru/` logs in through VK OpenAPI `getLoginStatus`, a third-party-cookie request to `login.vk.com`. As of 2026-10 it answers `{"auth":false,"user":false}` even for a user signed into VK, and the "Подключить" popup doesn't get past it either (likely cause, unverified: VK moved to `vk.ru` and/or third-party cookies are blocked, so `login.vk.com` sees no session). Open the game through the VK app page **`https://vk.com/ezhiky_game`** instead: VK passes the session to the game iframe directly, and the extension injects into that iframe (`all_frames`). The HC panel appears over the game as usual.
 
 ### From the panel (quickest)
 
@@ -106,10 +108,10 @@ The Hedgehog Vision panel (top-right of the game tab) has a **▶ Headless Run**
 
 ### From the console (more flexible)
 
-Open DevTools on the game tab:
+Open DevTools on the game tab. On the bare URL the game iframe is same-origin, so you can bind it from the top frame. On `vk.com/ezhiky_game` the iframe is cross-origin: pick the `valley.redspell.ru` context in the DevTools console's context dropdown and use `HC_Headless` directly (or drive it via the `HC_CMD` bridge, e.g. `headlessRun` with `{maxFriends: 1}`).
 
 ```js
-// Bind once (game's iframe is same-origin on the bare URL)
+// Bind once (bare URL only; inside the iframe context it's just HC_Headless)
 HH = document.querySelector('iframe').contentWindow.HC_Headless
 
 HH.help()                       // print usage

@@ -6,7 +6,7 @@
   "permissions": ["debugger"],
   "background": { "service_worker": "background.js" },
   "action": {
-    "default_title": "Open Ёжики (valley.redspell.ru)"
+    "default_title": "Open Ёжики (vk.com/ezhiky_game)"
   },
   "content_scripts": [
     {

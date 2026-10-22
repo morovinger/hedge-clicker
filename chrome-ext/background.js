@@ -3,12 +3,13 @@
 // Synthetic events from the page context are filtered by PIXI's
 // interaction manager — these aren't.
 //
-// The toolbar action just opens https://valley.redspell.ru/ — that page
-// pulls the user's VK session from cookies automatically, no
-// token-juggling needed.
+// The toolbar action opens the VK app page (vk.com/ezhiky_game), which
+// hands the session to the game iframe directly. The bare
+// valley.redspell.ru page logs in via a third-party-cookie OpenAPI check
+// that answers {"auth":false} since 2026-10 (doc 09).
 
 const HC_BG_VERSION = '0.4.0';
-const GAME_URL = 'https://valley.redspell.ru/';
+const GAME_URL = 'https://vk.com/ezhiky_game';
 console.log('[HC-BG] service worker started, version', HC_BG_VERSION);
 
 let attached = null;   // { targetId } once attached
@@ -93,8 +94,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 });
 
 // ── Toolbar action ──
-// Single click → open the game in a new tab. valley.redspell.ru pulls
-// the VK session from cookies automatically; no token URL needed.
+// Single click → open the game (VK app page) in a new tab.
 chrome.action.onClicked.addListener(() => {
   chrome.tabs.create({ url: GAME_URL });
 });

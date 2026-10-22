@@ -62,7 +62,7 @@ Every reply is shaped `{type: 'HC_RES', id, ok, value, error}`. Errors come back
 
 ## Toolbar action
 
-Clicking the extension icon opens `https://valley.redspell.ru/` in a new tab. As long as you're signed into VK in the same Chrome profile, the vendor page pulls the session automatically — no token juggling needed.
+Clicking the extension icon opens `https://vk.com/ezhiky_game` in a new tab. As long as you're signed into VK in the same Chrome profile, VK hands the session to the game iframe — no token juggling needed. (The bare `https://valley.redspell.ru/` page answers `{"auth":false}` from its VK login check since 2026-10; see doc 09.)
 
 The toolbar icon shows a small green badge with the version (e.g. `4.0`) so you can confirm at a glance which build is loaded.
 

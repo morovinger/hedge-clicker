@@ -1,5 +1,5 @@
 // Hedgehog Clicker (Ёжики) — autonomous friend-farm collector
-// Built: 2026-06-12
+// Built: 2026-10-22
 //
 // HOW TO USE:
 // 1. Open the game at https://vk.com/ezhiky_game
@@ -1977,10 +1977,13 @@
   // dependency on HC_DbgClick, no need for the game tab to be foregrounded.
   //
   // Server endpoints used (see doc/08-network-replay-and-protocol.md):
-  //   5000 073d  — В путь (start travel cycle, fetch friend list)
-  //   0500 013d  — enter friend farm
-  //   5000 033d  — collect single object (eid + type known from farm-load)
-  //   5000 093d  — Далее (advance to next friend)
+  //   5000 07VV  — В путь (start travel cycle, fetch friend list)
+  //   0500 01VV  — enter friend farm
+  //   5000 03VV  — collect single object (eid + type known from farm-load)
+  //   5000 09VV  — Далее (advance to next friend)
+  // VV is the protocol-version byte (0x3d until mid-2026, 0x4e since the
+  // 2026-10 game update). The server rejects a mismatched VV with err 0x01,
+  // so it's read from live traffic — see protoVer().
   //
   // Per-click hash is server-side IGNORED → we forge a random hex string.
   // request_id second-part must be monotonically increasing per-session →
@@ -2031,6 +2034,23 @@
       return all.length ? all[all.length - 1] : null;
     }
   
+    // ── Protocol-version byte (byte 3 of every request and response) ──
+    // Taken from the newest server response in the ring: the server is
+    // authoritative (even its error envelopes `00 00 00 VV` carry it), and
+    // the game's own first request (own-farm load) always lands there.
+    const DEFAULT_PROTO_VER = 0x4e;
+    function protoVer() {
+      const all = N.findRequests({ sinceMs: 3600000, withBytes: true });
+      for (let i = all.length - 1; i >= 0; i--) {
+        const resp = all[i].resp;
+        if (resp && resp.length >= 4) return resp[3];
+      }
+      return DEFAULT_PROTO_VER;
+    }
+  
+    // 4-byte request header: <b0> 00 <b2> <version>
+    function hdr(b0, b2) { return [b0, 0x00, b2, protoVer()]; }
+  
     // ── Direct send: build URL from a template + body bytes, return parsed response ──
     function send(opcodeBytes, bodyBytes, opts) {
       opts = opts || {};
@@ -2048,8 +2068,8 @@
   
     // ── Body builders ──
     function buildVoyage(friendIdHex32) {
-      // 50 00 07 3d  00 00 00 00 00  <32 ASCII hex>
-      const out = [0x50, 0x00, 0x07, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x00];
+      // 50 00 07 VV  00 00 00 00 00  <32 ASCII hex>
+      const out = hdr(0x50, 0x07).concat([0x00, 0x00, 0x00, 0x00, 0x00]);
       for (let i = 0; i < 32; i++) out.push(friendIdHex32.charCodeAt(i));
       return out;
     }
@@ -2064,41 +2084,43 @@
     // and only swap the trailing 32-char friend ID. Avoids any byte-ordering
     // drift between game versions. Falls back to a synthesized body that
     // matches the format observed in this session's captures:
-    //   05 00 01 3d  00 03 00 00 00  01 00 00  <32 ASCII hex>
+    //   05 00 01 VV  00 03 00 00 00  01 00 00  <32 ASCII hex>
     function buildEnterFarm(friendIdHex32) {
-      const tpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x05, 0x00, 0x01, 0x3d] }).slice(-1)[0];
+      const tpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: hdr(0x05, 0x01) }).slice(-1)[0];
       if (tpl && tpl.req && tpl.req.length === 44) pinnedTpl.enter = tpl.req.slice();
       if (pinnedTpl.enter) {
         const out = pinnedTpl.enter.slice();
+        out[3] = protoVer();
         for (let i = 0; i < 32; i++) out[12 + i] = friendIdHex32.charCodeAt(i);
         return out;
       }
       // synthesized fallback — header is 12 bytes, friend id is 32 bytes
-      const out = [0x05, 0x00, 0x01, 0x3d, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+      const out = hdr(0x05, 0x01).concat([0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
       for (let i = 0; i < 32; i++) out.push(friendIdHex32.charCodeAt(i));
       return out;
     }
   
     function buildDalee(friendIdHex32) {
       // Prefer copying captured Далее template (same trick as buildEnterFarm).
-      const tpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x50, 0x00, 0x09, 0x3d] }).slice(-1)[0];
+      const tpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: hdr(0x50, 0x09) }).slice(-1)[0];
       if (tpl && tpl.req && tpl.req.length === 41) pinnedTpl.dalee = tpl.req.slice();
       if (pinnedTpl.dalee) {
         const out = pinnedTpl.dalee.slice();
+        out[3] = protoVer();
         for (let i = 0; i < 32; i++) out[9 + i] = friendIdHex32.charCodeAt(i);
         return out;
       }
-      const out = [0x50, 0x00, 0x09, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x00];
+      const out = hdr(0x50, 0x09).concat([0x00, 0x00, 0x00, 0x00, 0x00]);
       for (let i = 0; i < 32; i++) out.push(friendIdHex32.charCodeAt(i));
       return out;
     }
   
-    // 50 00 03 3d  00 <contentLen-uint8> 00 00 00
+    // 50 00 03 VV  00 <contentLen-uint8> 00 00 00
     // 24 00 <36-char UUID with dashes>
     // <typeCode-uint8> <eid-uint32-LE> <typeNameLen-uint16-LE> <ASCII type>
     // 01 00 00 00 <32-char ASCII hex (random — server-ignored)>
     function buildCollect(friendUuidWithDashes, typeCode, eid, typeName) {
-      const out = [0x50, 0x00, 0x03, 0x3d, 0x00];
+      const out = hdr(0x50, 0x03).concat([0x00]);
       // content-len placeholder at out[5] — patched at end
       out.push(0x00); // placeholder
       out.push(0x00, 0x00, 0x00);
@@ -2127,7 +2149,7 @@
   
     // ── Parsers ──
   
-    // Parse the friend list from a captured В путь (5000 073d) response.
+    // Parse the friend list from a captured В путь (5000 07VV) response.
     // Each friend record begins with `24 00` followed by a 36-char ASCII UUID.
     function parseVoyageResp(bytes) {
       if (!bytes) return [];
@@ -2172,7 +2194,7 @@
       if (pfx === 'ga_' && COLLECTIBLE_GA_RE.test(typeName)) return true;
       return false;
     }
-    // Type-prefix code for collect requests (byte 47 of 5000 033d body).
+    // Type-prefix code for collect requests (byte 47 of 5000 03VV body).
     // Verified: 01=sb_, 02=ga_, 03=te_. Others empirically guessed.
     const TYPE_PREFIX_CODE = { sb_: 0x01, ga_: 0x02, te_: 0x03, pl_: 0x04, fl_: 0x05, pi_: 0x06 };
   
@@ -2226,13 +2248,13 @@
       // reusing a cached *error* response parses to 0 friends and dead-ends
       // the cycle. The friend ID in the body is payload-irrelevant (doc 08),
       // so any captured one (or zeros) works.
-      const enterTpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x05, 0x00, 0x01, 0x3d] }).slice(-1)[0];
+      const enterTpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: hdr(0x05, 0x01) }).slice(-1)[0];
       let placeholderId = '00000000000000000000000000000000';
       if (enterTpl) {
         const tail = enterTpl.req.slice(enterTpl.req.length - 32);
         placeholderId = String.fromCharCode.apply(null, tail);
       }
-      const r = await send([0x50, 0x00, 0x07, 0x3d], buildVoyage(placeholderId), { proto: '50x7' });
+      const r = await send(hdr(0x50, 0x07), buildVoyage(placeholderId), { proto: '50x7' });
       if (r.error) {
         log('В путь failed: ' + r.error);
         return { error: r.error };
@@ -2282,7 +2304,7 @@
   
     async function enterFriendFarm(friendHex32) {
       log('entering friend ' + friendHex32.slice(0, 8) + '…');
-      const r = await send([0x05, 0x00, 0x01, 0x3d], buildEnterFarm(friendHex32), { proto: '5x1' });
+      const r = await send(hdr(0x05, 0x01), buildEnterFarm(friendHex32), { proto: '5x1' });
       log('  enter result: env=' + r.envelope + ' ok=' + r.ok + ' load=' + r.load + ' respLen=' + r.respLen);
       const diag = diagnoseErrorResp(r.resp);
       if (diag) log('  ✗ ' + diag);
@@ -2318,7 +2340,7 @@
         if (stopRequested) break;
         const tc = typeCodeFor(o.type);
         if (tc === 0x00) continue;
-        const r = await send([0x50, 0x00, 0x03, 0x3d], buildCollect(friendUuidWithDashes, tc, o.eid, o.type), { proto: '50x3' });
+        const r = await send(hdr(0x50, 0x03), buildCollect(friendUuidWithDashes, tc, o.eid, o.type), { proto: '50x3' });
         tried++;
         if (r.ok) {
           acks++; consecErr = 0;
@@ -2367,7 +2389,7 @@
   
     async function dalee(nextFriendHex32) {
       log('Далее → ' + nextFriendHex32.slice(0, 8) + '…');
-      const r = await send([0x50, 0x00, 0x09, 0x3d], buildDalee(nextFriendHex32), { proto: '50x9' });
+      const r = await send(hdr(0x50, 0x09), buildDalee(nextFriendHex32), { proto: '50x9' });
       log('  Далее result: env=' + r.envelope + ' ok=' + r.ok + ' respLen=' + r.respLen);
       const diag = diagnoseErrorResp(r.resp);
       if (diag) log('  ✗ ' + diag);

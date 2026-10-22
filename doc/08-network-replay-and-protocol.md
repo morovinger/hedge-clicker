@@ -204,10 +204,11 @@ Not every parsed object is collectible. Server returns `"FriendAction: does not 
 
 ## Error response taxonomy
 
-All error responses use the `00 00` envelope and mirror the request opcode in the next 2 bytes (`00 3d`). Byte 5 is the **error code**; the meaning of subsequent bytes depends on the code. Confirmed codes (2026-05-03):
+All error responses use the `00 00` envelope followed by `00 <version>` (`00 3d` before the 2026-10 game update, `00 4e` after; the version byte is byte 3 of every request and response). Byte 5 is the **error code**; the meaning of subsequent bytes depends on the code. Confirmed codes (2026-05-03):
 
 | Code | Resp len | Trailing text? | Meaning | Triggered by |
 |---|---|---|---|---|
+| `0x01` | 10 B | none | protocol-version mismatch | request byte 3 (version) differs from the server's. Seen 2026-10-23 when the game moved from `3d` to `4e` while `HC_Headless` still hardcoded `3d` — every request failed, starting with В путь ("STOP — no friends"). `HC_Headless.protoVer()` now reads byte 3 from the latest server response. |
 | `0x02` | 11 B | none | state mismatch / wrong farm context | replay-driven session-state desync — usually after a previous cycle didn't terminate cleanly. Page reload fixes. |
 | `0x13` | small + text | `"expired request"` | request_id rejected (reused or non-monotonic) | bad `request_id` generation — see "request_id semantics". |
 | `0x32` | 59 B | `dumps'.<player_uuid>_<eid_suffix>` | object cannot be collected | calling collect on an object that's in our `collectibles` list but the server says no — wrong type, wrong state, not ready, scenery (e.g. some `pl_*` event variants, `ga_tree` subtypes). **Does not consume quota.** Free "no" from the server. |
