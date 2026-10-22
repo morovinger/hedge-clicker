@@ -38,14 +38,22 @@ widgets that overlay the canvas and interfere with click automation.
 
 ## Why this matters for automation
 
-- **No iframe.** The game is the top-level document, so injecting and
-  using DevTools is straightforward.
+- **Same-origin iframe.** The bare URL still hosts the game in an iframe,
+  but it's same-origin with the parent — so the top frame's DevTools can
+  reach `document.querySelector('iframe').contentWindow.HC_*` directly,
+  no console-context switching. (Caveat for DbgClick: same-origin means
+  one shared debugger target, so click coords need the iframe's
+  `getBoundingClientRect()` offset — `dbgclick.js` handles this. See
+  doc 08 "gotchas".)
 - **No VK-side captchas / popups** — the launcher's interstitials never
   appear.
 - **No token expiry** — the cookie auto-refreshes server-side; no need
   to capture, store, or rewrite URLs.
-- **chrome.debugger doesn't conflict** with Claude-in-Chrome MCP, which
-  attaches to its own tab.
+- **chrome.debugger conflict warning:** the Claude-in-Chrome MCP
+  `javascript_tool` opens its own debugger session on the tab, which
+  evicts the extension's attach and breaks DbgClick until it reattaches
+  (doc 08). Don't run MCP eval and HC_Visit clicks at the same time.
+  The headless loop is unaffected — it never uses the debugger.
 
 This makes `https://valley.redspell.ru/` the supported environment for
 all `HC_Visit` / `HC_DbgClick` development and runtime.

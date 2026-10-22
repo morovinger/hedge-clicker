@@ -32,12 +32,10 @@ Doc #08 has the full byte layouts, error codes, and `request_id` rules.
 
 ## Module map
 
-The browser-side bundle is eight small modules concatenated into one IIFE by `build.js`. Load order matters because earlier modules install hooks the later ones depend on.
+The browser-side bundle is nine small modules concatenated into one IIFE by `build.js`. Load order matters because earlier modules install hooks the later ones depend on.
 
 ```
-glspy → network → dbgclick → capture → scenegraph → overlay → visit → ui
-                                                                ↑
-                                                  headless lives here
+glspy → network → dbgclick → capture → scenegraph → overlay → visit → headless → ui
 ```
 
 What each one does:
@@ -52,7 +50,7 @@ What each one does:
 | `overlay` | object-position renderer over canvas | no |
 | `visit` | click-driven autonomous visit loop | no (legacy) |
 | `headless` | XHR-driven autonomous visit loop | **yes** — the loop |
-| `ui` | draggable panel | no (we drive from console) |
+| `ui` | draggable panel (▶ Headless Run button + legacy visit controls) | optional — panel or console both work |
 
 The headless loop only depends on `HC_Net` (the XHR observer/classifier/replay engine in `network.js`). Everything else is dead weight for the current path — kept around as it's useful for prototyping new endpoints and as a reference.
 
@@ -81,8 +79,9 @@ HC_Headless.runCycle()
   │     │     └── if !r.ok → check error reason; "does not have availible actions" → quotaHit, break
   │     │
   │     └── dalee(nextFriend.hex32)
-  │           ├── replay(template, urlMutate→proto=50x9, body=buildDalee(nextFriend.hex32))
-  │           └── farm-load returned in r.resp (or pulled from ring after 5s)
+  │           └── replay(template, urlMutate→proto=50x9, body=buildDalee(nextFriend.hex32))
+  │               (ack only — the paired farm-load never arrives for fabricated
+  │                XHRs; the next iteration's enterFriendFarm fetches the farm)
   │
   └── log "=== END (visited=N, loot: ra_leaf:X ra_dry_grass:Y) ==="
 ```
@@ -180,7 +179,7 @@ chrome-ext/
 ├── background.js          — chrome.debugger session for HC_DbgClick
 ├── iframe-script.js       — generated bundle, document_start
 ├── iframe-isolated.js     — postMessage bridge for DbgClick
-└── popup.html, popup.js   — toolbar icon UI
+└── icons/                 — toolbar icon (no popup; the action button opens the game)
 
 build.js                    Concatenates src/ into clicker.js + chrome-ext/iframe-script.js
 clicker.js                  Generated paste-bundle (DevTools fallback)

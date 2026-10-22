@@ -11,7 +11,8 @@ const SRC = path.join(__dirname, 'src');
 const PASTE_OUT = path.join(__dirname, 'clicker.js');
 const EXT_OUT = path.join(__dirname, 'chrome-ext', 'iframe-script.js');
 
-// Load order matters: capture stub first, then GL/network spies, then visit + ui.
+// Load order matters: hook installers first (glspy wraps getContext, network
+// wraps XHR), then click/canvas plumbing, then the loops, ui last.
 const modules = ['glspy.js', 'network.js', 'dbgclick.js', 'capture.js', 'scenegraph.js', 'overlay.js', 'visit.js', 'headless.js', 'ui.js'];
 
 function readModules() {
@@ -69,9 +70,10 @@ function buildPasteBundle(mods) {
 }
 
 // ── Build #2: chrome extension content script ──
-// Runs at document_start in MAIN world. Loads config + capture eagerly so
-// our getContext hook beats PIXI. Defers everything else (UI, modules,
-// bridge) until HC_Capture has captured a real WebGL context.
+// Runs at document_start in MAIN world. Loads the hook installers eagerly so
+// glspy's getContext wrap and network's XHR wrap beat PIXI / the game's first
+// POST. Defers everything else (loops, UI, bridge) until HC_Capture has
+// located the game canvas.
 function buildExtBundle(mods) {
   const header = `// Hedgehog Clicker — Chrome extension content script (auto-injected into game iframe)
 // Built: ${new Date().toISOString().slice(0, 10)}
@@ -87,6 +89,23 @@ function buildExtBundle(mods) {
     console.log('[HC-Ext] Re-injecting (already initialized — capture hook stays)');
   }
   window.__hcExtInit = true;
+
+  // ── HC_LOG mirror ──
+  // Modules inside the game iframe call window.parent.postMessage({type:'HC_LOG',...})
+  // for every log line. This script runs eagerly in BOTH the iframe and the top
+  // frame (manifest: all_frames:true), so installing the listener here means the
+  // TOP frame's DevTools console echoes every line — no need to switch the
+  // console context to the iframe. The iframe never receives its own postMessage,
+  // so this listener is effectively a no-op there (the iframe still gets logs
+  // via the modules' direct console.log calls).
+  if (!window.__hcLogMirrorInstalled) {
+    window.__hcLogMirrorInstalled = true;
+    window.addEventListener('message', function(ev) {
+      const m = ev && ev.data;
+      if (!m || m.type !== 'HC_LOG') return;
+      try { console.log(m.line); } catch (e) {}
+    });
+  }
 `;
 
   const bridge = `

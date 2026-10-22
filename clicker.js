@@ -1,5 +1,5 @@
 // Hedgehog Clicker (Ёжики) — autonomous friend-farm collector
-// Built: 2026-05-02
+// Built: 2026-06-12
 //
 // HOW TO USE:
 // 1. Open the game at https://vk.com/ezhiky_game
@@ -2013,8 +2013,14 @@
     // ── request_id generator: monotonic per-session ──
     // Format <7d random>.<integer>. The second part must be ≥ the highest
     // the server has seen this session, so we anchor to Date.now() ms.
+    // The % 1e8 wraps every ~27.8h; the lastReqCounter guard keeps the
+    // counter monotonic across the wrap (a lower value → err 0x13).
+    let lastReqCounter = 0;
     function freshReqId() {
-      return Math.floor(Math.random() * 9e6 + 1e6) + '.' + (Date.now() % 100000000);
+      let c = Date.now() % 100000000;
+      if (c <= lastReqCounter) c = lastReqCounter + 1;
+      lastReqCounter = c;
+      return Math.floor(Math.random() * 9e6 + 1e6) + '.' + c;
     }
   
     // ── pick the most recent /proto.html template to copy URL skeleton ──
@@ -2048,6 +2054,12 @@
       return out;
     }
   
+    // Captured request templates, pinned so they survive ring eviction (the
+    // 32-entry ring only covers ~2-3 minutes once background ticks churn
+    // through it — the "last hour" findRequests window is much wider than
+    // what the ring actually retains).
+    const pinnedTpl = {};
+  
     // Enter-farm body — when possible, copy bytes from a captured template
     // and only swap the trailing 32-char friend ID. Avoids any byte-ordering
     // drift between game versions. Falls back to a synthesized body that
@@ -2055,8 +2067,9 @@
     //   05 00 01 3d  00 03 00 00 00  01 00 00  <32 ASCII hex>
     function buildEnterFarm(friendIdHex32) {
       const tpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x05, 0x00, 0x01, 0x3d] }).slice(-1)[0];
-      if (tpl && tpl.req && tpl.req.length === 44) {
-        const out = tpl.req.slice();
+      if (tpl && tpl.req && tpl.req.length === 44) pinnedTpl.enter = tpl.req.slice();
+      if (pinnedTpl.enter) {
+        const out = pinnedTpl.enter.slice();
         for (let i = 0; i < 32; i++) out[12 + i] = friendIdHex32.charCodeAt(i);
         return out;
       }
@@ -2069,8 +2082,9 @@
     function buildDalee(friendIdHex32) {
       // Prefer copying captured Далее template (same trick as buildEnterFarm).
       const tpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x50, 0x00, 0x09, 0x3d] }).slice(-1)[0];
-      if (tpl && tpl.req && tpl.req.length === 41) {
-        const out = tpl.req.slice();
+      if (tpl && tpl.req && tpl.req.length === 41) pinnedTpl.dalee = tpl.req.slice();
+      if (pinnedTpl.dalee) {
+        const out = pinnedTpl.dalee.slice();
         for (let i = 0; i < 32; i++) out[9 + i] = friendIdHex32.charCodeAt(i);
         return out;
       }
@@ -2206,45 +2220,72 @@
     // ── High-level operations ──
   
     async function fetchFriendList() {
-      // Look for a cached В путь response in the ring; if none, fire one.
-      let voyage = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x50, 0x00, 0x07, 0x3d] }).slice(-1)[0];
-      if (!voyage || !voyage.resp) {
-        log('no В путь in ring — fabricating one');
-        // Need ANY 32-char hex friend ID for the body — try latest 0500 013d or use placeholder
-        const enterTpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x05, 0x00, 0x01, 0x3d] }).slice(-1)[0];
-        let placeholderId = '00000000000000000000000000000000';
-        if (enterTpl) {
-          const tail = enterTpl.req.slice(enterTpl.req.length - 32);
-          placeholderId = String.fromCharCode.apply(null, tail);
-        }
-        const r = await send([0x50, 0x00, 0x07, 0x3d], buildVoyage(placeholderId), { proto: '50x7' });
-        log('В путь fired: env=' + r.envelope + ' respLen=' + r.respLen);
-        // Wait briefly for the captured XHR to land in ring then re-fetch
-        await sleep(300);
-        voyage = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x50, 0x00, 0x07, 0x3d] }).slice(-1)[0];
-        if (!voyage) return { error: 'В путь fired but response not captured' };
+      // Always fire a fresh В путь — it (re)starts travel mode server-side.
+      // Reusing a cached response from a previous cycle skips that step, so
+      // the following enter-friend calls bounce with "user not in travel";
+      // reusing a cached *error* response parses to 0 friends and dead-ends
+      // the cycle. The friend ID in the body is payload-irrelevant (doc 08),
+      // so any captured one (or zeros) works.
+      const enterTpl = N.findRequests({ sinceMs: 3600000, withBytes: true, reqStartsWith: [0x05, 0x00, 0x01, 0x3d] }).slice(-1)[0];
+      let placeholderId = '00000000000000000000000000000000';
+      if (enterTpl) {
+        const tail = enterTpl.req.slice(enterTpl.req.length - 32);
+        placeholderId = String.fromCharCode.apply(null, tail);
       }
-      const friends = parseVoyageResp(voyage.resp);
+      const r = await send([0x50, 0x00, 0x07, 0x3d], buildVoyage(placeholderId), { proto: '50x7' });
+      if (r.error) {
+        log('В путь failed: ' + r.error);
+        return { error: r.error };
+      }
+      const envLabel = (r.envelope == null || r.envelope === '') ? '\\x00(err)' : r.envelope;
+      log('В путь fired: env=' + envLabel + ' respLen=' + r.respLen);
+      const diag = diagnoseErrorResp(r.resp);
+      if (diag) {
+        log('  ✗ ' + diag);
+        return { error: diag };
+      }
+      // replay() returns the full response bytes — parse them directly. No
+      // ring round-trip: that race against background ticks is what made the
+      // old cached-voyage path grab stale or errored entries.
+      const friends = parseVoyageResp(r.resp);
       log('parsed ' + friends.length + ' friends from В путь response');
-      return { friends, voyageSeq: voyage.seq };
+      return { friends };
     }
   
-    // Pull the captured response bytes out of the ring (replay() only returns
-    // a summary, the bytes are stored on the ring entry by the XHR observer).
-    function lastRingResp(envelope, sinceMs) {
-      const recent = N.findRequests({ sinceMs: sinceMs || 3000, withBytes: true });
-      for (let i = recent.length - 1; i >= 0; i--) {
-        const e = recent[i];
-        if (envelope && e.env !== envelope) continue;
-        if (e.resp) return e;
+    // Classify a /proto.html error response (envelope `00 00`). Returns a
+    // human-readable diagnosis or null if the bytes don't look like an error.
+    // Error format (per doc 08):
+    //   00 00 <opcode-2B> 00 <code-uint8> [trailing ASCII reason]
+    function diagnoseErrorResp(bytes) {
+      if (!bytes || bytes.length < 6) return null;
+      if (bytes[0] !== 0x00 || bytes[1] !== 0x00) return null;
+      const code = bytes[5];
+      let tail = '';
+      for (let i = 6; i < Math.min(bytes.length, 200); i++) {
+        const c = bytes[i];
+        if (c >= 0x20 && c < 0x7f) tail += String.fromCharCode(c);
       }
-      return null;
+      if (code === 0x02) {
+        return 'server state desync (err 0x02) — reload the game page, then retry';
+      }
+      if (code === 0x13) {
+        return 'request_id rejected (err 0x13 "' + tail + '") — sid in template is stale; reload page';
+      }
+      if (code === 0x32) {
+        return 'object not collectible (err 0x32) — ' + tail;
+      }
+      if (code === 0x61) {
+        return 'per-friend quota exhausted (err 0x61) — ' + tail;
+      }
+      return 'server error code 0x' + code.toString(16).padStart(2, '0') + (tail ? ' "' + tail + '"' : '');
     }
   
     async function enterFriendFarm(friendHex32) {
       log('entering friend ' + friendHex32.slice(0, 8) + '…');
       const r = await send([0x05, 0x00, 0x01, 0x3d], buildEnterFarm(friendHex32), { proto: '5x1' });
       log('  enter result: env=' + r.envelope + ' ok=' + r.ok + ' load=' + r.load + ' respLen=' + r.respLen);
+      const diag = diagnoseErrorResp(r.resp);
+      if (diag) log('  ✗ ' + diag);
       // Use replay's own bytes — game's error-retry flood can evict ring entries
       // before we can read them back.
       const farmLoad = (r.resp && r.respLen >= 5000) ? { resp: r.resp, respLen: r.respLen } : null;
@@ -2269,8 +2310,12 @@
       let tried = 0, acks = 0, errs = 0, consecErr = 0, quotaHit = false;
       let withRes = 0, withoutRes = 0, consecEmpty = 0, backpackFull = false;
       const resourceTotals = {};
+      // Standalone calls (console debugging) run with running=false — clear
+      // any stale stop flag so the loop actually executes. Inside runCycle
+      // the flag is managed by runCycle/stop.
+      if (!running) stopRequested = false;
       for (const o of collectibles) {
-        if (!running) break;
+        if (stopRequested) break;
         const tc = typeCodeFor(o.type);
         if (tc === 0x00) continue;
         const r = await send([0x50, 0x00, 0x03, 0x3d], buildCollect(friendUuidWithDashes, tc, o.eid, o.type), { proto: '50x3' });
@@ -2324,41 +2369,32 @@
       log('Далее → ' + nextFriendHex32.slice(0, 8) + '…');
       const r = await send([0x50, 0x00, 0x09, 0x3d], buildDalee(nextFriendHex32), { proto: '50x9' });
       log('  Далее result: env=' + r.envelope + ' ok=' + r.ok + ' respLen=' + r.respLen);
-      // Per doc 08, the server returns two responses 5s apart for Далее: a small
-      // P\0 ack first, then the \x05 farm-load. Wait for the farm-load to land
-      // in the ring (only the second response carries the next farm's bytes).
-      let farmLoad = null;
-      if (r.respLen >= 5000) {
-        farmLoad = { resp: r.resp, respLen: r.respLen };
-      } else {
-        // Small ack — poll the ring for the trailing farm-load.
-        const sinceSeq = N.findRequests({ sinceMs: 60000 }).slice(-1)[0]?.seq || 0;
-        const t0 = Date.now();
-        while (Date.now() - t0 < 8000) {
-          const recent = N.findRequests({ sinceMs: 8000, withBytes: true });
-          for (let i = recent.length - 1; i >= 0; i--) {
-            const e = recent[i];
-            if (e.seq <= sinceSeq) break;
-            if (e.load && e.respLen >= 5000) { farmLoad = e; break; }
-          }
-          if (farmLoad) break;
-          await sleep(200);
-        }
-      }
+      const diag = diagnoseErrorResp(r.resp);
+      if (diag) log('  ✗ ' + diag);
+      // The paired \x05 farm-load never arrives for fabricated XHRs (doc 08
+      // client-desync gotcha), and runCycle re-enters each friend explicitly
+      // anyway — so no ring polling here. Keep the farm-load only when the
+      // server happens to return it inline with the ack.
+      const farmLoad = (r.resp && r.respLen >= 5000) ? { resp: r.resp, respLen: r.respLen } : null;
       return { result: r, farmLoad };
     }
   
     // ── Full cycle ──
     let running = false;
+    let stopRequested = false;
   
     async function runCycle(opts) {
       opts = opts || {};
       if (running) { log('runCycle ignored — already running'); return; }
       running = true;
+      stopRequested = false;
       try {
         log('=== headless cycle START ===');
         const fl = await fetchFriendList();
-        if (!fl.friends || fl.friends.length === 0) { log('STOP — no friends'); return; }
+        if (!fl.friends || fl.friends.length === 0) {
+          log('STOP — no friends' + (fl.error ? ' (' + fl.error + ')' : ''));
+          return;
+        }
         // Default: iterate every candidate the В путь response gave us. The cycle
         // self-terminates when the backpack fills, so an explicit cap is only
         // useful for debug runs (e.g. maxFriends: 1).
@@ -2399,7 +2435,7 @@
       }
     }
   
-    function stop() { running = false; log('stop requested'); }
+    function stop() { stopRequested = true; running = false; log('stop requested'); }
     function isRunning() { return running; }
   
     function help() {

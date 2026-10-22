@@ -4,33 +4,36 @@
 
 Injectable / extension-bundled script targeting a PIXI.js WebGL game running inside a cross-origin iframe on VK (`valley.redspell.ru/play/vk/index.html`). The current build is **not** a vision pipeline — earlier HSL-based smart-mode (`config.js` / `vision.js` / `clicker.js`) was removed in #07 once the network-decoding path landed.
 
-The active pipeline drives friend-farm collection by:
-1. Observing `/proto.html` XHRs to know when collect actions succeed.
-2. Dispatching trusted clicks via a `chrome.debugger` session owned by the extension's background service worker.
-3. Sweeping a static grid (or, eventually, parsed object coords from the farm-load packet) over the canvas, then advancing to the next friend farm.
+The active pipeline (`HC_Headless`, branch `headless-replay-loop`) drives friend-farm collection entirely over the wire — no canvas clicks:
+1. Observing `/proto.html` XHRs to capture request templates and classify responses.
+2. Fabricating the travel-cycle requests directly (В путь → enter friend → collect × N → Далее) via `HC_Net.replay` with fresh `request_id`s.
+3. Parsing each farm-load response for collectible object eids, collecting until the per-friend quota (`0x61`) or backpack-full signal hits.
 
-The code is split into 8 modules concatenated into one IIFE by `build.js`, which writes two outputs:
+The older click-driven loop (`HC_Visit` + `HC_DbgClick` grid sweeps through a `chrome.debugger` session) still ships as a fallback/debugging path. See doc 09 for the current-setup on-ramp.
+
+The code is split into 9 modules concatenated into one IIFE by `build.js`, which writes two outputs:
 - `clicker.js` — paste-into-DevTools bundle (manual fallback).
 - `chrome-ext/iframe-script.js` — extension content script, injected into the game iframe at `document_start`.
 
 ### Module load order (strict dependency chain)
 
 ```
-glspy.js → network.js → dbgclick.js → capture.js → scenegraph.js → overlay.js → visit.js → ui.js
+glspy.js → network.js → dbgclick.js → capture.js → scenegraph.js → overlay.js → visit.js → headless.js → ui.js
 ```
 
-The extension build splits these into two phases: `glspy` / `network` / `dbgclick` / `capture` / `scenegraph` load eagerly at `document_start` (so the WebGL `getContext` hook beats PIXI), and `overlay` / `visit` / `ui` are deferred until `HC_Capture.whenReady()` fires.
+The extension build splits these into two phases: `glspy` / `network` / `dbgclick` / `capture` / `scenegraph` load eagerly at `document_start` (so glspy's WebGL `getContext` hook beats PIXI and network's XHR hook sees the first POST), and `overlay` / `visit` / `headless` / `ui` are deferred until `HC_Capture.whenReady()` fires.
 
 ### Module responsibilities
 
 - **glspy.js** — `HC_GLSpy`. Hooks WebGL state changes to fingerprint draw calls and snapshot texture usage. Used for offline scene-graph reverse engineering, not by the live loop.
 - **network.js** — `HC_Net`. Wraps `XMLHttpRequest` to observe `/proto.html` responses. Classifies each response by its 2-byte envelope (`0x50 0x00` = `"P\0"` = action ok, `0x30 0x00` = `"0\0"` = idle tick, anything else = error). Keeps a 32-entry ring of recent (req, resp) byte pairs and exposes `lastFarmObjects()` / `lastFarmLoadSeq()` / `awaitNextFarmLoad()` for callers that need to know "did the game just load a new farm?"
 - **dbgclick.js** — `HC_DbgClick`. Front-end of the debugger-click path. Forwards click coords to the extension's isolated-world script via `postMessage`, which forwards to the background service worker, which dispatches `Input.dispatchMouseEvent` through its `chrome.debugger` session. Synthetic events on the canvas don't work — PIXI's `InteractionManager` ignores untrusted clicks — so the debugger path is the only reliable way to drive the game.
-- **capture.js** — `HC_Capture`. Thin canvas locator. Hooks `HTMLCanvasElement.getContext` so any future module can grab the real WebGL context, but the live loop only uses `HC_Capture.canvas` for `getBoundingClientRect`.
+- **capture.js** — `HC_Capture`. Thin canvas locator. Polls `document.querySelectorAll('canvas')` every 200 ms (gives up after 60 s) until the game canvas — the non-default-size one — appears; installs no hooks. `whenReady()` gates the deferred modules; the click path only uses `HC_Capture.canvas` for `getBoundingClientRect`.
 - **scenegraph.js** — `HC_Scene`. Best-effort PIXI scene graph discovery (`__PIXI_DEVTOOLS_GLOBAL_HOOK__`, canvas back-refs, window globals). Diagnostic-only; no live-loop dependency.
 - **overlay.js** — `HC_Overlay`. Renders parsed farm-load objects onto a transparent canvas overlay, with a tunable world→screen transform (`tw`, `th`, `cx`, `cy`). The default transform is a guess; `HC_Overlay.calibrateFromPairs` lets you fit it from known (world, canvas) coord pairs. **Until calibration runs, projected coords are not trustworthy** — `HC_Visit.sweepMode` defaults to `'grid'` for that reason.
-- **visit.js** — `HC_Visit`. The autonomous loop. Bootstraps into a friend farm via hub probes if needed, runs one full grid pass per farm, then tries the popup `Далее` and bottom-left `Далее` buttons in sequence to advance. Stops after 2 consecutive empty advances (backpack-full proxy).
-- **ui.js** — `HC_UI`. Draggable panel with START/STOP, Sweep Once, Enter Hub Farm, Probe DbgClick, three coord pickers, a live diagnostic line, and a 160px scrollable log box mirroring `HC_Visit.log` lines via `postMessage` to the parent frame.
+- **visit.js** — `HC_Visit`. The click-driven loop (legacy — superseded by `headless.js` for the autonomous path). Bootstraps into a friend farm via hub probes if needed, runs one full grid pass per farm, then tries the popup `Далее`, the bottom-left `Далее`, and finally a central popup-hunt scan to advance. Stops after 2 consecutive empty advances or 2 zero-resource sweeps (backpack-full proxies).
+- **headless.js** — `HC_Headless`. The current autonomous path. Drives the full friend cycle by fabricating `/proto.html` POSTs through `HC_Net.replay`: fires В путь (`5000 073d`) to start travel and get the candidate list, enters each friend (`0500 013d`), collects parsed objects (`5000 033d`, via `parseFarmLoadV2`), advances with Далее (`5000 093d`). Depends only on `HC_Net`. See doc 08/09.
+- **ui.js** — `HC_UI`. Draggable panel with ▶ Headless Run / ■ Stop, START/STOP for the legacy visit loop, Sweep Once, Enter Hub Farm, Probe DbgClick, three coord pickers, a live diagnostic line, and a 160px scrollable log box merging `HC_Visit` + `HC_Headless` log lines (also mirrored to the top frame's console via `postMessage`).
 
 ## Key Technical Details
 
@@ -40,9 +43,11 @@ The game communicates with the server via length-prefixed binary `POST /proto.ht
 
 | Bytes (hex) | ASCII | Meaning |
 |-------------|-------|---------|
-| `50 00`     | `P\0` | Action acknowledged — a click hit a real interactable, state changed. Counts as `totalOk`. |
+| `50 00`     | `P\0` | Action acknowledged — collect/Далее accepted, state changed. Counts as `totalOk`. |
 | `30 00`     | `0\0` | Background tick / idle poll — no state change. Counts as `totalTick`. |
-| `00 00`     | —     | Error envelope (e.g. "expired request"). Counts as `totalErr`. |
+| `05 00`     | `\x05\0` | Server state push — session-init bundle (~1.77 MB) and friend-farm loads (~594 KB–1.77 MB). Counts as `totalLoad`. |
+| `00 00`     | —     | Error envelope; byte 5 is the error code, ASCII reason may follow (see doc 08's error taxonomy). Counts as `totalErr`. |
+| `10 00`     | —     | Own-farm collect ack — not yet classified by `HC_Net`, currently miscounted as error (doc 08, open question 6). |
 | anything else | —   | Unknown — logged as `envelope=<char>` for debugging. |
 
 **Caveat**: background terrain tiles also produce `P\0` responses on click. The success oracle therefore can't tell "I collected a resource" from "I clicked grass and the server acknowledged the click" — only "the click reached the game." This is why `maxSweepsPerFarm = 1`: there is no reliable per-cell signal to stop early.
@@ -90,7 +95,7 @@ If the loop fires clicks but `HC_Net.totalOk` stays at 0:
 - Confirm you're not in an empty hub view — `HC_Net.lastFarmLoadSeq()` should be non-null.
 
 If `enterFarmFromHub` never finds a farm:
-- The hub-probe grid (`HUB_PROBES` in visit.js, x=200–850 step 130, y=220–520 step 100, 24 points) only covers the typical hub layout. A farm icon outside that bounding box won't get hit; widen the grid.
+- The hub-probe list (`HUB_PROBES` in visit.js) is 4 panel-picker-confirmed icon coords plus a tight 5×5 fallback grid (x=380–580 step 50, y=220–460 step 60). A farm icon outside that central cluster won't get hit; widen the grid or re-pick coords.
 
 If you want parsed-object sweeps instead of grid:
 - Calibrate `HC_Overlay` first via `overlayCalibrate` with two or more known (world, canvas) point pairs.
